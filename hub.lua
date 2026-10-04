@@ -30,7 +30,7 @@ if env.BulbulComebackLoad and env.BulbulComebackLoad.inProgress then
     warn("[bülbül comeback] Menü yüklemesi devam ediyor; tamamlanmasını bekle.")
     return env.BulbulComeback
 end
-local report={ready=false,stage="Başlatılıyor",build="crypt-age-batch-10"}
+local report={ready=false,stage="Başlatılıyor",build="transport-auto-register-11"}
 report.inProgress=true
 env.BulbulComebackLoad=report
 local previousCare=env.AdoptMeCompanion
@@ -592,6 +592,151 @@ return function(randomIndex)
 end
 
 end)()
+local transportFactory=(function()
+return function()
+    local env=getgenv and getgenv() or _G
+    local player=game.Players.LocalPlayer
+    local old=env.AdoptMeTransportActive
+    if old and old.owner==player.UserId and old.server==game.JobId then return old end
+    local newGuard=(function()
+-- All callers share one native transport lease, including late responses.
+return function(ctx)
+    local guard={active=nil,status="Konum hazır",stalls=0,completed=0,sequence=0,history={}}
+    local function record(kind,a)
+        guard.history[#guard.history+1]={kind=kind,time=ctx.Now(),destination=a.destination,ownerId=a.ownerId,
+            sequence=a.sequence,error=guard.error}
+        if #guard.history>30 then table.remove(guard.history,1)end
+        if ctx.Record then pcall(ctx.Record,guard.history)end
+    end
+    local function read()return ctx.Read() or {}end
+    local function validNow(valid)
+        return not valid or valid()==true
+    end
+    local function matches(record,r)
+        return r.destination==record.destination and
+            (not record.ownerId or r.ownerId==record.ownerId) and
+            r.loaded==true and r.characterReady==true and not r.forced and not r.externalBusy
+    end
+    function guard.isBusy()return guard.active~=nil end
+    function guard.isReady()
+        if guard.active then return false end
+        local r=read()
+        return r.loaded==true and r.characterReady==true and not r.forced and not r.externalBusy
+    end
+    function guard.snapshot()
+        local a=guard.active
+        return {pending=a~=nil,destination=a and a.destination,ownerId=a and a.ownerId,started=a and a.started,
+            phase=a and a.phase,status=guard.status,error=guard.error,stalls=guard.stalls,completed=guard.completed,
+            last=guard.last,
+            busyFor=a and math.max(0,ctx.Now()-a.started) or 0}
+    end
+    function guard.waitReady(valid,seconds)
+        local deadline=ctx.Now()+(seconds or 25)
+        while true do
+            assert(validNow(valid),"Konum beklemesi iptal edildi.")
+            local r=read()
+            assert(not r.forced,"Mini oyun geçişi sırasında konum bekleniyor.")
+            if not guard.active and r.loaded==true and r.characterReady==true and not r.externalBusy then return true end
+            assert(ctx.Now()<deadline,"Önceki konumun yüklenmesi henüz bitmedi.")
+            ctx.Wait(0.1)
+        end
+    end
+    function guard.watch()
+        local a=guard.active
+        if a and ctx.Now()-a.started>=45 and not a.stalled then
+            a.stalled=true;guard.stalls+=1
+            guard.status="Konum geçişi uzadı · yeni geçişler bekletiliyor"
+            record("stalled",a)
+        end
+        -- A timeout never releases an unfinished native call or its generation.
+        return guard.snapshot()
+    end
+    function guard.enter(destination,door,options,valid)
+        options=options or {}
+        local queueDeadline=ctx.Now()+25
+        while true do
+            assert(validNow(valid),"Konum geçişi iptal edildi.")
+            local r=read()
+            assert(not r.forced,"Mini oyun geçişi sırasında konum isteği gönderilmez.")
+            if not guard.active and not r.externalBusy then break end
+            assert(ctx.Now()<queueDeadline,"Önceki konum geçişi henüz bitmedi.")
+            ctx.Wait(0.1)
+        end
+        assert(validNow(valid),"Konum geçişi iptal edildi.")
+        guard.sequence+=1
+        local a={destination=destination,ownerId=options.house_owner and options.house_owner.UserId,
+            started=ctx.Now(),phase="native",sequence=guard.sequence}
+        guard.active=a;guard.error=nil;guard.status=destination.." yükleniyor"
+        record("started",a)
+        local packed=table.pack(pcall(ctx.Enter,destination,door,options))
+        a.phase="scene"
+        local settled,r=pcall(function()
+            local deadline=ctx.Now()+20
+            while true do
+                local current=read()
+                if matches(a,current)then return current end
+                assert(validNow(valid),"Konum sonucu beklenirken işlem iptal edildi.")
+                assert(not current.forced,"Konum sonucu sırasında mini oyun geçişi başladı.")
+                assert(ctx.Now()<deadline,"Hedef konumun yüklenmesi doğrulanamadı.")
+                ctx.Wait(0.1)
+            end
+        end)
+        local recovered,recoverError=true,nil
+        if settled and ctx.Recover then recovered,recoverError=pcall(ctx.Recover,a,r)end
+        if guard.active==a then guard.active=nil end
+        if not packed[1]then guard.error=tostring(packed[2]);guard.status="Konum geçişi hata verdi"
+        elseif not settled then guard.error=tostring(r);guard.status="Konum yüklenmesi bekleniyor"
+        elseif not recovered then guard.error=tostring(recoverError);guard.status="Konum ekranı temizliği başarısız"
+        else guard.completed+=1;guard.status="Konum hazır";guard.error=nil end
+        guard.last={destination=a.destination,ownerId=a.ownerId,error=guard.error,time=ctx.Now()}
+        record(guard.error and "error" or "settled",a)
+        assert(packed[1],packed[2]);assert(settled,r);assert(recovered,recoverError)
+        return table.unpack(packed,2,packed.n)
+    end
+    return guard
+end
+
+    end)()
+    local load=require(game.ReplicatedStorage.Fsys).load
+    local Interiors,Door,Forced=load("InteriorsM"),load("Door"),load("MinigameForcedState")
+    local guard=newGuard({Now=os.clock,Wait=task.wait,
+        Record=function(events)
+            if type(writefile)=="function" then
+                local loc=Interiors.get_current_location()
+                local visible={}
+                for name,app in pairs(load("UIManager").apps or {})do
+                    local key=tostring(name):lower()
+                    if app.visible and (key:find("transition",1,true)or key:find("loading",1,true))then visible[#visible+1]=tostring(name)end
+                end
+                writefile("bulbul-transport-"..player.UserId..".txt",game:GetService("HttpService"):JSONEncode({events=events,userId=player.UserId,server=game.JobId,
+                    destination=loc and loc.destination_id,doorBusy=Door.entering_door==true,forced=Forced.is_enabled(),visibleLoadingApps=visible}))
+            end
+        end,
+        Enter=function(destination,door,options)return Interiors.enter_smooth(destination,door,options)end,
+        Read=function()
+            local loc=Interiors.get_current_location()
+            local character=player.Character
+            local root=character and character:FindFirstChild("HumanoidRootPart")
+            local interior=loc and loc.interior
+            local map=loc and loc.destination_id=="MainMap" and workspace:FindFirstChild("StaticMap") or nil
+            return {destination=loc and loc.destination_id,ownerId=loc and loc.house_owner and loc.house_owner.UserId,
+                loaded=interior~=nil and (interior==workspace or interior.Parent~=nil) or map~=nil and map.Parent~=nil,
+                characterReady=root~=nil and root.Parent~=nil,externalBusy=Door.entering_door==true,
+                forced=Forced.is_enabled()}
+        end})
+    guard.owner,guard.server=player.UserId,game.JobId
+    env.AdoptMeTransportActive=guard
+    task.spawn(function()
+        while env.AdoptMeTransportActive==guard do
+            local ok,err=pcall(guard.watch)
+            if not ok then guard.error=tostring(err)end
+            task.wait(1)
+        end
+    end)
+    return guard
+end
+
+end)()
 assert(game.PlaceId == 920587237, "Bu script Adopt Me icindir.")
 local env = getgenv and getgenv() or _G
 local headless=env.BulbulComebackHost~=nil
@@ -630,6 +775,7 @@ local Router = load("RouterClient")
 local FurnitureTracker = load("FurnitureModelTracker")
 local FurnitureUseDB = load("FurnitureUseDB")
 local MinigameForcedState = load("MinigameForcedState")
+local transport=transportFactory()
 local StateManager = load("StateManagerClient")
 local AdminAbuse = require(RS.new.modules.AdminAbuse)
 local SharedConstants = load("SharedConstants")
@@ -816,13 +962,15 @@ local function equip()
     while alive and os.clock() < deadline and not selectedWrapper() do task.wait(0.2) end
     assert(not alive or selectedWrapper(), "Sunucu peti takmayi dogrulamadi.")
 end
-local function navigate(destination)
+local function navigate(destination,valid)
+    local navigationValid=valid or function()return alive and not pauseReason and not MinigameForcedState.is_enabled()end
+    transport.waitReady(navigationValid)
     assert(not data("roleplay_role"), "Aktif isi bitirdikten sonra konum degistir.")
     local allowed, reason = Interiors.can_enter(destination)
     assert(allowed, reason or "Konum gecisi su anda uygun degil.")
     if locationId() ~= destination then
         notify(destination .. " konumuna gidiliyor…")
-        Interiors.enter_smooth(destination, "MainDoor", {})
+        transport.enter(destination, "MainDoor", {},navigationValid)
     end
     assert(locationId() == destination, "Sunucu konum gecisini dogrulamadi.")
 end
@@ -982,15 +1130,16 @@ local function careNavigate(destination, row, token, settings)
     end
     navigationOwner = row
     local navigationOK, navigationError = xpcall(function()
+    bounded(function()transport.waitReady(function()return enabled(row,token)end)end,row,token,30)
     if destination == "housing" then
         local loc = Interiors.get_current_location()
         if loc and loc.destination_id == "housing" and loc.house_owner == player then return end
         assert(not data("roleplay_role"), "Aktif is nedeniyle ev gecisi bekliyor.")
         bounded(function()
-            Interiors.enter_smooth("housing", "MainDoor", {house_owner = player})
+            transport.enter("housing", "MainDoor", {house_owner = player},function()return enabled(row,token)end)
         end, row, token, 30)
     else
-        bounded(function() navigate(destination) end, row, token, 30)
+        bounded(function() navigate(destination,function()return enabled(row,token)end) end, row, token, 30)
     end
     checkCare(row, token)
     assert(locationId() == destination, "Konum degisikligi dogrulanamadi.")
@@ -1627,6 +1776,7 @@ local function playCare(row, token, owned)
 end
 local function performCare(row, token, owned, plan)
     checkCare(row, token)
+    bounded(function()transport.waitReady(function()return enabled(row,token)end)end,row,token,30)
     waitAnchor(row, token, plan)
     if row.target == "pet" then bounded(equip, row, token, 15) end
     local current = currentTask(row)
@@ -1872,6 +2022,7 @@ local function tickCare()
         notify("Mini oyun sırasında pet/bebek bakımı bekliyor.")
         return
     end
+    if not transport.isReady() then notify(transport.snapshot().status);return end
     if tickPetChoice() then return end
     -- A task from an older build or a manually entered seat may have no worker
     -- left to release it. Recover before scheduling the next baby action.
@@ -2099,6 +2250,7 @@ function api.setWaterBudget(value)
     waterBudget=math.floor(amount);wakeCare()
 end
 function api.isIdle() return not busy and actionPending==0 and careScheduler.Count()==0 end
+api.transport=transport
 function api.select(unique)
     assert(petInventory()[unique], "Bu pet envanterinde bulunamadi.")
     assert(not busy, "Once mevcut islemin bitmesini bekle.")
@@ -2137,7 +2289,7 @@ function api.snapshot()
         waterReserved=reservedFoodBudget(),pendingFoodPurchases=select(2,reservedFoodBudget()),
         venueState = venueState, lastError = lastError, alive = alive,
         autoCandy = env.AdoptMeCandyRain and env.AdoptMeCandyRain.enabled or false,
-        notice=api.notice}
+        transport=transport.snapshot(),notice=api.notice}
 end
 function api.pets()
     rebuildPets()
@@ -3004,6 +3156,10 @@ end
     local Tracker,UseDB=load("FurnitureModelTracker"),load("FurnitureUseDB")
     local Policy,Forced=load("PolicyHelper"),load("MinigameForcedState")
     local pauseText="Bucks aktarımı için bakım bekliyor"
+    local function enter(destination,door,options,valid)
+        if care.transport then return care.transport.enter(destination,door,options,valid)end
+        return Interiors.enter_smooth(destination,door,options)
+    end
     local beforeLocation,register,activeDebit=nil,nil,nil
     local ownsPause,transportStarted=false,false
     local cache=env.BulbulRegisterCache
@@ -3075,6 +3231,7 @@ end
     transfer=newLoop({Now=os.clock,Spawn=task.spawn,Resolve=resolve,Balance=balance,Wait=task.wait,
         Save=function(prefs)prefs.ownerId=player.UserId;env.BulbulBucksPrefs=prefs end,
         Allowed=function()
+            if care.transport and not care.transport.isReady()then return false,"Konum yüklenirken ödeme bekliyor"end
             if Forced.is_enabled()then return false,"Mini oyun sırasında ödeme bekliyor"end
             local disabled,reason=Policy.is_all_trading_disabled()
             if disabled then return false,reason or "Oyuncular arası işlem şu anda kapalı"end
@@ -3100,12 +3257,46 @@ end
             if transfer.remoteOnly then
                 findRegister(target)
                 register=cache.registers[target.UserId]
-                assert(register and register.owner==target.UserId,"Kasa kimliği bilinmiyor; hedefin evindeyken kasayı bir kez kaydet.")
+                if not register then
+                    transfer.status="Hedefin kasası otomatik bulunuyor · ilk ev ziyareti"
+                    if not ownerIs(location(),target)then
+                        transportStarted=true
+                        enter("housing","MainDoor",{house_owner=target},valid)
+                    end
+                    check(valid);assert(ownerIs(location(),target),"Hedefin evine girilemedi; ev kilitli olabilir.")
+                    local deadline=os.clock()+8
+                    repeat
+                        check(valid);findRegister(target);register=cache.registers[target.UserId]
+                        if register then break end
+                        task.wait(0.2)
+                    until os.clock()>=deadline
+                    if not register then
+                        transfer.setEnabled(false)
+                        transfer.status="Hedefin kasası yüklenemedi veya kasa yok · aktarım durdu"
+                        error(transfer.status)
+                    end
+                    check(valid)
+                    if transportStarted and beforeLocation and beforeLocation.id then
+                        local current=location()
+                        if not current or current.destination_id~=beforeLocation.id or current.house_owner~=beforeLocation.owner then
+                            enter(beforeLocation.id,"MainDoor",beforeLocation.owner and {house_owner=beforeLocation.owner}or {},valid)
+                        end
+                        check(valid)
+                        local character=player.Character
+                        if character and beforeLocation.pivot then
+                            character:PivotTo(beforeLocation.pivot)
+                            local root=character:FindFirstChild("HumanoidRootPart")
+                            if root then root.AssemblyLinearVelocity=Vector3.zero end
+                        end
+                    end
+                    transportStarted=false
+                end
+                assert(register and register.owner==target.UserId,"Hedefin kasa kimliği doğrulanamadı.")
                 return
             end
             if not ownerIs(location(),target)then
                 transportStarted=true
-                Interiors.enter_smooth("housing","MainDoor",{house_owner=target})
+                enter("housing","MainDoor",{house_owner=target},valid)
             end
             check(valid);assert(ownerIs(location(),target),"Hedefin evine girilemedi; ev kilitli olabilir.")
             local deadline=os.clock()+8
@@ -3154,7 +3345,9 @@ end
                 local current=location()
                 if not current or current.destination_id~=beforeLocation.id or current.house_owner~=beforeLocation.owner then
                     restored,restoreError=pcall(function()
-                        Interiors.enter_smooth(beforeLocation.id,"MainDoor",beforeLocation.owner and {house_owner=beforeLocation.owner}or {})
+                        enter(beforeLocation.id,"MainDoor",beforeLocation.owner and {house_owner=beforeLocation.owner}or {},function()
+                            return hub.running and care.snapshot().alive and care.snapshot().pauseReason==pauseText and not Forced.is_enabled()
+                        end)
                     end)
                 end
                 if restored and hub.running and care.snapshot().pauseReason==pauseText and not Forced.is_enabled() and beforeLocation.pivot then
@@ -3588,6 +3781,7 @@ return targets
     end
     local state=newLoop({Now=os.clock,Spawn=task.spawn,
         Allowed=function()
+            if care.transport and not care.transport.isReady()then return false,"Konum geçişi sırasında anahtar ve iksir bekliyor"end
             local cycle=hub.autoJoin
             if not hub.running or Forced.is_enabled() or cycle and cycle.phase~="idle" then return false,"Ghost / geçiş sırasında anahtar ve iksir bekliyor"end
             return true
@@ -3595,7 +3789,7 @@ return targets
         Acquire=function(_,valid)
             check(valid)
             assert(not care.snapshot().pauseReason,"Bakım başka bir işlem için bekliyor.")
-            care.setPaused(pauseText);ownsPause=true
+            ownsPause=true;care.setPaused(pauseText)
             local deadline=os.clock()+30
             while not care.isIdle()do check(valid);assert(os.clock()<deadline,"Bakım temizliği bekleniyor.");task.wait(0.1)end
         end,
@@ -7182,7 +7376,7 @@ local ok,err=xpcall(function()
                 (loc and loc.destination_id:find("ManorMinigameInterior",1,true)~=nil),
             timestamp=cycle and cycle.timestamp,queued=m and m.is_queued,inJoinZone=inJoinZone(),
             loading=m and m.minigame_state:get("players_loading"),canInvite=Forced.can_receive_invites()}
-    end,Ready=function() local s=care.snapshot();return not transfer.busy and not inventoryAutomation.busy and not s.busy and s.activeCareJobs==0 end,
+    end,Ready=function() local s=care.snapshot();return care.transport.isReady() and not transfer.busy and not inventoryAutomation.busy and not s.busy and s.activeCareJobs==0 end,
         Pause=function(reason)cyclePauseReason=reason;transfer.setPaused(reason);care.setPaused(reason);candy.setPaused(reason)end,
         Resume=function()
             transfer.setPaused(nil)
@@ -7196,37 +7390,8 @@ local ok,err=xpcall(function()
                     local m=assert(manager(),"Ghost Gallery henüz yüklenmedi.")
                     local loc=location()
                     if not loc or loc.destination_id~=m.join_zone_destination_id then
-                        local UI=nativeLoad("UIManager")
-                        local dialog=UI.apps.DialogApp
-                        local matching=false
-                        if dialog.visible then
-                            for _,label in ipairs(dialog.instance:GetDescendants()) do
-                                if label:IsA("TextLabel") and label.Text:find("Ghost Gallery",1,true) and label.Text:find("Teleport",1,true) then matching=true;break end
-                            end
-                        end
-                        local accepted=false
-                        if matching and firesignal then
-                            for _,label in ipairs(dialog.instance:GetDescendants()) do
-                                if (label:IsA("TextLabel") or label:IsA("TextButton")) and label.Text=="Yes" then
-                                    local button=label
-                                    while button and not button:IsA("GuiButton") do button=button.Parent end
-                                    if button and button.Visible then
-                                        -- Native DepthButton requires a down event before accepting a click.
-                                        firesignal(button.MouseButton1Down)
-                                        firesignal(button.MouseButton1Click)
-                                        firesignal(button.MouseButton1Up)
-                                        accepted=true;break
-                                    end
-                                end
-                            end
-                        end
-                        if accepted then
-                            local deadline=os.clock()+25
-                            repeat task.wait(0.1);loc=location() until not valid() or os.clock()>deadline or loc and loc.destination_id==m.join_zone_destination_id
-                        else
-                            local spawn=workspace.StaticMap.TeleportLocations:FindFirstChild(m.minigame_id)
-                            Interiors.enter_smooth(m.join_zone_destination_id,"MainDoor",{spawn_cframe=spawn and spawn.CFrame})
-                        end
+                        local spawn=workspace.StaticMap.TeleportLocations:FindFirstChild(m.minigame_id)
+                        care.transport.enter(m.join_zone_destination_id,"MainDoor",{spawn_cframe=spawn and spawn.CFrame},valid)
                     end
                     assert(hub.running and valid(),"Katılım iptal edildi.")
                     local collider=joinCollider();local deadline=os.clock()+8
@@ -7433,12 +7598,11 @@ local ok,err=xpcall(function()
     transferInput("TransferLimit","Toplam limit (0 = sınırsız)","limit",transfer.setLimit)
     transferInput("TransferReserve","Bakiyede bırakılacak Bucks","reserve",transfer.setReserve)
     toggle(tabs.transfer,"TransferEnabled","Sürekli para aktar","Seçilen oyuncunun kasasına düzenli ödeme yapar.",function()return transfer.enabled end,transfer.setEnabled)
-    toggle(tabs.transfer,"TransferRemoteOnly","Konum değiştirmeden ödeme","Kaydedilmiş kasaya native çağrı gönderir. Ayarı değiştirmek için aktarımı durdur.",function()return transfer.remoteOnly end,transfer.setRemoteOnly)
-    tabs.transfer:CreateButton{Title="Bu evdeki kasayı kaydet",Callback=action(function()transfer.captureRegister();ui:Notify{Title="Kasa kaydedildi",Content="Bu sunucuda konum değiştirmeden ödeme için hazır.",Duration=4}end)}
+    toggle(tabs.transfer,"TransferRemoteOnly","İlk ziyaretten sonra uzaktan ödeme","Kasayı otomatik bulup konumuna döner; sonraki gruplar uzaktan gönderilir. Ayarı değiştirmek için aktarımı durdur.",function()return transfer.remoteOnly end,transfer.setRemoteOnly)
     local transferStatus=paragraph(tabs.transfer,"TransferStatus","Aktarım durumu")
     tabs.transfer:CreateButton{Title="Aktarımı durdur",Callback=action(function()transfer.setEnabled(false)end)}
     tabs.transfer:CreateButton{Title="Aktarım sayacını sıfırla",Callback=action(transfer.reset)}
-    tabs.transfer:CreateParagraph("TransferInfo",{Title="Kasa üzerinden toplu Bucks",Content="Her ödeme en fazla 50 Bucks. Bir gruptaki ödemeler, her kesinti doğrulandıktan sonra sırayla gönderilir. Kasa reddederse grup durur ve bekler. Konum değiştirmeden ödeme için kasa kimliği bu sunucuda kaydedilmiş olmalı; kaydetmek için hedefin evine bir kez gir. Her yüklemede aktarım kapalı başlar."})
+    tabs.transfer:CreateParagraph("TransferInfo",{Title="Kasa üzerinden toplu Bucks",Content="Kasa bilinmiyorsa hedefin evine bir kez otomatik girer, kasayı bulur ve konumuna döner. Sonraki ödemeler uzaktan gönderilir. Her ödeme en fazla 50 Bucks; gruptaki her kesinti doğrulanınca sıradaki ödeme başlar. Kasa reddederse grup durur ve bekler. Her yüklemede aktarım kapalı başlar."})
     tabs.tools:CreateButton{Title="SimpleSpy'ı aç",Callback=action(function()
         if not env.SimpleSpy or not _G.SimpleSpyExecuted then
             local fn,compileError=loadstring(spySource,"=Bulbul-SimpleSpy");assert(fn,compileError);fn()
@@ -7550,8 +7714,9 @@ local ok,err=xpcall(function()
         local watch,trace=env.AdoptMeEventWatch,env.AdoptMeSpyTrace
         local afk=hub.afk.snapshot();local errors={}
         for name,failure in pairs(hub.runtimeErrors)do table.insert(errors,name..": "..failure)end
-        setText(afkStatus,string.format("AFK: %s · %d giriş\n%s",afk.enabled and "Açık" or "Kapalı",afk.count,
-            afk.lastError or #errors>0 and table.concat(errors,"\n") or "Sistem çalışıyor"))
+        local travel=care.transport.snapshot()
+        setText(afkStatus,string.format("AFK: %s · %d giriş\nGeçiş: %s · uzun geçiş: %d\n%s",afk.enabled and "Açık" or "Kapalı",afk.count,travel.status,travel.stalls,
+            travel.error or afk.lastError or #errors>0 and table.concat(errors,"\n") or "Sistem çalışıyor"))
         setText(traceStatus,string.format("SimpleSpy: %s\nEtkinlik kaydı: %s · %d kayıt\nPet kaydı: %s · %d kayıt",env.SimpleSpy and "Açık" or "Kapalı",watch and watch.running and "Açık" or "Kapalı",watch and #watch.records or 0,trace and trace.running and "Açık" or "Kapalı",trace and #trace.records or 0))
     end
     update()
