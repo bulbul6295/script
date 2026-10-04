@@ -30,7 +30,7 @@ if env.BulbulComebackLoad and env.BulbulComebackLoad.inProgress then
     warn("[bülbül comeback] Menü yüklemesi devam ediyor; tamamlanmasını bekle.")
     return env.BulbulComeback
 end
-local report={ready=false,stage="Başlatılıyor",build="area-care-21"}
+local report={ready=false,stage="Başlatılıyor",build="parallel-care-22"}
 report.inProgress=true
 env.BulbulComebackLoad=report
 local previousCare=env.AdoptMeCompanion
@@ -316,7 +316,7 @@ local newCareScheduler = (function()
 -- Resource leases outlive cancellation until the worker's cleanup has finished.
 -- This module has no remotes; the companion supplies native task actions.
 return function(ctx)
-    local scheduler = {jobs = {}, cooldown = {}, failures = {}, maxJobs = 6, peak = 0, recoveries = 0}
+    local scheduler = {jobs = {}, cooldown = {}, failures = {}, waiting={},maxJobs = 6, peak = 0, recoveries = 0}
     local function key(row)
         -- Baby ailments belong to the local character, independently of the
         -- pet selection. A hatch/swap must not create a second baby worker or
@@ -326,23 +326,26 @@ return function(ctx)
             ":" .. tostring(row.kind) .. ":" .. tostring(row.raw.created_timestamp)
     end
     local function compatible(a, b)
-        if a.location and b.location and a.location ~= b.location then return false end
+        if a.location and b.location and a.location ~= b.location then return false,"Konum görevi bitince başlayacak" end
         -- A location-only task needs the entire venue, while an outdoor task
         -- needs a particular area within MainMap.
-        if a.zone and b.zone and a.zone ~= b.zone then return false end
+        if a.zone and b.zone and a.zone ~= b.zone then return false,"Diğer görev alanı bitince başlayacak" end
         for _, ar in ipairs(a.resources or {}) do
-            for _, br in ipairs(b.resources or {}) do if ar == br then return false end end
+            for _, br in ipairs(b.resources or {}) do if ar == br then
+                return false,ar=="tools"and"Araç başka bir görevde kullanılıyor"or ar=="walking"and"Hareket/oturma görevi bekleniyor"or
+                    ar:sub(1,6)=="actor:"and"Aynı karakterin mevcut işlemi bekleniyor"or"Ortak kullanım kaynağı bekleniyor"
+            end end
         end
         return true
     end
-    function scheduler.Count()
-        local count = 0; for _ in pairs(scheduler.jobs) do count += 1 end; return count
+    function scheduler.Count(target)
+        local count = 0; for _,job in pairs(scheduler.jobs) do if not target or job.row.target==target then count += 1 end end; return count
     end
     function scheduler.Valid(job)
         return not job.cancelled and ctx.Alive() and ctx.Enabled(job.row, job.token)
     end
-    function scheduler.Cancel()
-        for _, job in pairs(scheduler.jobs) do job.cancelled = true end
+    function scheduler.Cancel(target)
+        for _, job in pairs(scheduler.jobs) do if not target or job.row.target==target then job.cancelled = true end end
         -- Retain all leases until Run returns, including pending server calls.
         ctx.Wake()
     end
@@ -372,11 +375,28 @@ return function(ctx)
     function scheduler.Anchor()
         local best
         for _, job in pairs(scheduler.jobs) do
-            if not job.cancelled and job.plan.location and
+            if scheduler.Valid(job) and not job.result and job.plan.location and
                 (not best or job.plan.zone and not best.plan.zone or
                 (job.plan.zone ~= nil) == (best.plan.zone ~= nil) and job.started < best.started) then best = job end
         end
         return best
+    end
+    function scheduler.Movement(row)
+        if row.target~="pet"or(row.kind~="walk"and row.kind~="ride")then return end
+        for _,job in pairs(scheduler.jobs)do
+            if scheduler.Valid(job)and job.row.target=="pet"and job.row.unique==row.unique and
+                (job.row.kind=="walk"or job.row.kind=="ride")and job.row.kind~=row.kind and
+                job.plan.mode~="observe"and job.plan.ready then
+                local id=key(row)
+                job.siblings=job.siblings or{}
+                local evidence=job.siblings[id]
+                local ok,progress=pcall(ctx.Progress or function()end,row)
+                if not evidence then evidence={baseline=ok and progress or nil};job.siblings[id]=evidence end
+                local progressing=(row.raw.rate or 0)>0 or ok and type(progress)=="number"and
+                    type(evidence.baseline)=="number"and progress>evidence.baseline+.0001
+                return job,progressing==true
+            end
+        end
     end
     function scheduler.Tick(rows)
         if not ctx.Alive() then return end
@@ -398,6 +418,10 @@ return function(ctx)
         end
         local active = {}
         for _, row in ipairs(rows) do active[key(row)] = true end
+        for _,job in pairs(scheduler.jobs)do
+            for id in pairs(job.siblings or{})do if not active[id]then job.siblings[id]=nil end end
+        end
+        scheduler.waiting={}
         for id, untilTime in pairs(scheduler.cooldown) do
             if untilTime <= now or not active[id] and not scheduler.jobs[id] then scheduler.cooldown[id] = nil end
         end
@@ -409,12 +433,19 @@ return function(ctx)
         end
         for _, row in ipairs(rows) do
             local id = key(row)
+            local function waiting(reason,blocker)
+                scheduler.waiting[#scheduler.waiting+1]={target=row.target,key=row.key,kind=row.kind,reason=reason,
+                    blockingKind=blocker and blocker.row.kind,blockingTarget=blocker and blocker.row.target}
+            end
+            if not scheduler.jobs[id]and scheduler.cooldown[id]then waiting("Yeniden deneme süresi bekleniyor")end
+            if not scheduler.jobs[id]and not scheduler.cooldown[id]and scheduler.Count()>=scheduler.maxJobs then waiting("Paralel görev kapasitesi dolu")end
             if not scheduler.jobs[id] and not scheduler.cooldown[id] and scheduler.Count() < scheduler.maxJobs then
                 local ok, plan = pcall(ctx.Plan, row, scheduler)
                 if ok and plan then
                     local permitted = true
                     for _, running in pairs(scheduler.jobs) do
-                        if not compatible(plan, running.plan) then permitted = false; break end
+                        local allowed,reason=compatible(plan,running.plan)
+                        if not allowed then permitted = false;waiting(reason,running);break end
                     end
                     if permitted then
                         local job = {id = id, row = row, token = ctx.Token(), plan = plan,
@@ -443,6 +474,8 @@ return function(ctx)
                 elseif not ok then
                     scheduler.cooldown[id] = now + 15
                     ctx.Record({row = row}, {status = "failed", error = tostring(plan)})
+                    waiting("Görev planı yeniden denenecek")
+                else waiting(ctx.WaitReason and ctx.WaitReason(row)or"Native görev koşulu bekleniyor")
                 end
             end
         end
@@ -811,46 +844,49 @@ end
 
 end)()
 local voidCarePlan=(function()
--- Native care stays on the platform; authorized area tasks move the platform.
+-- Each plan owns its native mutations; passive area and venue progress can share them.
 return function(row,ctx)
     local kind=row.kind
-    local actor="actor:"..(row.target=="baby" and "baby" or tostring(row.unique))
-    local destination=ctx.anchor and ctx.anchor.plan.location or ctx.current
+    local actor="actor:"..(row.target=="baby"and"baby"or tostring(row.unique))
+    local anchor=ctx.anchor
+    local destination=anchor and anchor.plan.location or ctx.current
     local plan={location=destination,zone="void-home",atStation=true,stayPut=true,resources={},stallTimeout=60}
-    if ctx.platformAreas and ctx.platformAreas[kind] then
+    if kind=="mystery"then
+        plan.location,plan.zone=nil,nil
+        plan.resources={"mystery:"..actor}
+        return plan
+    end
+    if ctx.platformAreas and ctx.platformAreas[kind]then
         local area=ctx.platformAreas[kind]
-        if type(area)=="table" and area.petOnly and row.target=="baby"then
+        if type(area)=="table"and area.petOnly and row.target=="baby"then
             ctx.waiting[kind]="Bu görevi oyun yalnız petlere veriyor.";return nil
         end
         if kind=="party_zone"and not ctx.party then ctx.waiting[kind]="Parti etkinliği bekleniyor.";return nil end
-        plan.location,plan.zone,plan.mode=ctx.areaDestination or "MainMap",kind,"platform-area"
+        plan.location,plan.zone,plan.mode=ctx.areaDestination or"MainMap",kind,"platform-area"
+        plan.areaLease={kind=kind,location=plan.location}
         if type(area)=="table"then
             plan.areaInteraction=area.interaction
             plan.stallTimeout=area.interaction and 130 or 60
             if area.interaction then plan.resources={actor,"walking","tools"}end
         end
-        if ctx.anchor and ctx.anchor.plan.zone==kind then plan.anchor=ctx.anchor end
+        if anchor and anchor.plan.zone==kind then plan.anchor=anchor end
         return plan
     end
-    if ctx.areaKinds[kind] then
-        ctx.waiting[kind]="Bu görev sunucuda gerçek alan/mesafe kontrolü istiyor; platformdan tamamlanamıyor."
-        return nil
-    end
-    if kind=="at_work" then ctx.waiting[kind]="Aktif iş bitince bakım devam eder.";return nil end
-    if kind=="mystery" then plan.location=nil;plan.resources={actor};return plan end
-    if not ctx.venues[kind] then table.insert(plan.resources,actor) end
-    if (row.raw.rate or 0)>0 then
+    if ctx.areaKinds[kind]then ctx.waiting[kind]="Bu alan için native görev yolu henüz bulunamadı.";return nil end
+    if kind=="at_work"then ctx.waiting[kind]="Aktif iş bitince bakım devam eder.";return nil end
+    local movement=ctx.movement
+    if (kind=="walk"or kind=="ride")and movement and ctx.movementProgressing then
         plan.mode,plan.ready="observe",true
-        if row.target=="baby" and (kind=="sleepy" or kind=="dirty" or kind=="toilet")then table.insert(plan.resources,"walking")end
-        if (kind=="walk" or kind=="ride")and ctx.anchor and
-            (ctx.anchor.row.kind=="walk" or ctx.anchor.row.kind=="ride")and ctx.anchor.row.unique==row.unique then plan.resources={}end
+        plan.location,plan.zone=movement.plan.location,movement.plan.zone
+        plan.anchor,plan.observeSource,plan.areaLease=movement,movement,movement.plan.areaLease
         return plan
     end
-    if ctx.venues[kind] then plan.location=ctx.venues[kind]
-    elseif ctx.foodKinds[kind] and (row.target=="baby" or kind=="sick" or ctx.food)then
+    if not ctx.venues[kind]then table.insert(plan.resources,actor)end
+    if ctx.venues[kind]then plan.location=ctx.venues[kind]
+    elseif ctx.foodKinds[kind]and(row.target=="baby"or kind=="sick"or ctx.food)then
         plan.mode="food";plan.location=ctx.food and destination or ctx.foodVenues[kind]
         table.insert(plan.resources,"tools")
-    elseif kind=="hungry" or kind=="thirsty" or kind=="sleepy" or kind=="dirty" or kind=="toilet" then
+    elseif kind=="hungry"or kind=="thirsty"or kind=="sleepy"or kind=="dirty"or kind=="toilet"then
         local entry=ctx.furniture
         if entry then
             plan.mode,plan.location,plan.furniture="furniture","housing",entry
@@ -860,13 +896,29 @@ return function(row,ctx)
         elseif ctx.foodKinds[kind]then
             plan.mode,plan.location="food",ctx.foodVenues[kind];table.insert(plan.resources,"tools")
         else ctx.waiting[kind]="Kendi evinde uygun ve boş mobilya gerekiyor; otomatik yeniden kontrol ediliyor.";return nil end
-    elseif kind=="walk" or kind=="ride"then
+    elseif kind=="walk"or kind=="ride"then
         plan.location="MainMap";table.insert(plan.resources,"walking")
         if kind=="ride"then table.insert(plan.resources,"tools")end
     elseif kind=="play"then table.insert(plan.resources,"tools")
     elseif kind=="pet_me"then table.insert(plan.resources,"focus")
-    else ctx.waiting[kind]="Platformdan çalışan doğrulanmış görev yolu bulunamadı.";return nil end
-    if ctx.anchor and plan.location==ctx.anchor.plan.location then plan.anchor=ctx.anchor end
+    else ctx.waiting[kind]="Doğrulanmış native görev yolu bulunamadı.";return nil end
+    if anchor and anchor.plan.areaLease and not anchor.plan.areaInteraction then
+        local area=anchor.plan.areaLease.kind
+        local broad=area=="bored"or area=="camping"or area=="beach_party"
+        local portable=plan.mode=="food"and ctx.food and broad or kind=="pet_me"and broad or
+            (kind=="walk"or kind=="ride")and broad or ctx.venues[kind]
+        if portable and plan.location==anchor.plan.location then
+            plan.zone,plan.areaLease=anchor.plan.zone,anchor.plan.areaLease
+        end
+    end
+    if anchor and plan.location==anchor.plan.location and plan.zone==anchor.plan.zone then plan.anchor=anchor end
+    -- A replicated rate from the previous venue is not permission to observe
+    -- the task in the new one. Furniture observation keeps its actor/seat lease.
+    if (row.raw.rate or 0)>0 and plan.location==ctx.current then
+        if ctx.venues[kind]or plan.mode=="furniture"or kind=="walk"or kind=="ride"then
+            plan.mode,plan.ready="observe",true
+        end
+    end
     return plan
 end
 
@@ -1504,7 +1556,7 @@ local function stopGuide()
     if activeGuide then pcall(function() activeGuide:stop() end) end
     activeGuide = nil
 end
-local function runAction(fn)
+local function runAction(fn,cancelTarget)
     if not alive or busy or pauseReason or MinigameForcedState.is_enabled() or os.clock()<actionRetryAt then return false end
     busy = true
     task.spawn(function()
@@ -1519,7 +1571,7 @@ local function runAction(fn)
             lastError = tostring(err)
             venueState=nil;actionFailures=math.min(actionFailures+1,4)
             actionRetryAt=os.clock()+math.min(30,3*2^(actionFailures-1))
-            if cancelCare then cancelCare() end
+            if cancelCare then cancelCare(cancelTarget) end
             notify("İşlem yeniden denenecek: " .. tostring(err):match("[^\n]+"))
             warn("[AdoptMeCompanion] " .. tostring(err))
         else actionFailures=0;lastError=nil end
@@ -1671,9 +1723,9 @@ local function releaseCare(owned)
     owned.released = true
     return true
 end
-cancelCare = function()
-    careEpoch = careEpoch + 1
-    if careScheduler then careScheduler.Cancel() end
+cancelCare = function(target)
+    if not target then careEpoch = careEpoch + 1 end
+    if careScheduler then careScheduler.Cancel(target) end
     careDirty = true
 end
 local function enabled(row, token)
@@ -2719,6 +2771,10 @@ local function performCare(row, token, owned, plan)
         platformAreaCare(row,token,owned,plan)
         return
     end
+    if plan.areaLease then
+        owned.platformArea,owned.areaRow=true,row
+        bounded(function()return voidFarm.acquireArea(plan.areaLease.kind,owned,plan.areaLease.location)end,row,token,20)
+    end
     if plan.mode == "observe" then
         plan.ready = true
         if row.target=="baby" and (row.kind=="sleepy" or row.kind=="dirty" or row.kind=="toilet") then
@@ -2726,7 +2782,21 @@ local function performCare(row, token, owned, plan)
             owned.voidScene=voidMode and voidFarm.scene or nil
             lastBabySeatCharacter,lastBabySeatAt=player.Character,os.clock()
         end
+        if row.target=="pet" and (row.kind=="sleepy" or row.kind=="dirty" or row.kind=="toilet") then owned.pet=row.unique end
         plan.job.stage = "Sunucudaki mevcut ilerleme izleniyor"
+        if plan.observeSource then
+            local deadline=os.clock()+100
+            while currentTask(row) and os.clock()<deadline do
+                checkCare(row,token)
+                if not careScheduler.Valid(plan.observeSource) or plan.observeSource.result then
+                    error({retryShared=true,message="Ortak hareket sona erdi; kalan görev yeniden planlanacak."})
+                end
+                task.wait(.3)
+            end
+            checkCare(row,token)
+            assert(not currentTask(row),"Ortak hareket görevi tamamlanmadı.")
+            return
+        end
         assert(waitTask(row, token, 100), "Sunucudaki gorev ilerlemesi zaman asimina ugradi.")
         return
     end
@@ -2771,12 +2841,15 @@ local function performCare(row, token, owned, plan)
 end
 local function planCare(row, scheduler)
     if voidMode then
+        local movement,progressing
+        if scheduler.Movement then movement,progressing=scheduler.Movement(row)end
         local party=row.kind=="party_zone"and AdminAbuse.get_value("party_zone")or nil
         local scene=Interiors.get_current_location()
         local destination=party and party.destination_id or
             (row.kind=="rain_puddle"or row.kind=="snowman"or row.kind=="leaf_pile"or row.kind=="diving_board")and
             scene and scene.destination_id=="Neighborhood"and"Neighborhood"or"MainMap"
         return voidCarePlan(row,{current=locationId(),anchor=scheduler.Anchor and scheduler.Anchor(),waiting=stationWaiting,
+            movement=movement,movementProgressing=progressing,
             venues=venues,foodKinds=foodKinds,foodVenues=foodVenues,food=findFood(row.kind,row.target),
             furniture=findFurniture(row.kind,row.target,scheduler),
             platformAreas=platformAreas.definitions,party=party,areaDestination=destination,
@@ -2878,6 +2951,7 @@ local function planCare(row, scheduler)
 end
 careScheduler = newCareScheduler({Alive = function() return alive end, Token = function() return careEpoch end,
     Enabled = enabled, Now = os.clock, Spawn = task.spawn, Plan = planCare,
+    WaitReason=function(row)return stationWaiting[row.kind]end,
     Progress=function(row)
         local current=currentTask(row)
         if not current then return 1 end
@@ -2892,7 +2966,7 @@ careScheduler = newCareScheduler({Alive = function() return alive end, Token = f
         local row, token, owned, began = job.row, job.token, job.owned, job.started
         row.careJob, job.plan.job = job, job
         local ok, err = xpcall(function() performCare(row, token, owned, job.plan) end,function(value)
-            if type(value)=="table" and value.retryLocation then return value end
+            if type(value)=="table" and (value.retryLocation or value.retryShared) then return value end
             return debug.traceback(tostring(value),2)
         end)
         -- Keep actor/tool/location leases while a cancelled request is outstanding.
@@ -2920,6 +2994,9 @@ careScheduler = newCareScheduler({Alive = function() return alive end, Token = f
             released,releaseError=safeRelease()
         end
         local cancelled = not careScheduler.Valid(job)
+        if not cancelled and not ok and type(err)=="table" and err.retryShared then
+            return {status="retry",error=err.message}
+        end
         if not cancelled and not ok and type(err)=="table" and err.retryLocation then
             local route=careRoutes[careRouteKey(row)] or {visited={}}
             careRoutes[careRouteKey(row)]=route;route.location=err.retryLocation
@@ -2958,8 +3035,8 @@ local function tickPetChoice()
     local actual=os.clock()-lastPetEquipAt>=2 and equippedPetUnique()or nil
     local desired=petChoice.Choose(petList,actual or selected)
     if desired==selected and not petHandover then return false end
-    if careScheduler.Count()>0 then
-        if not petHandover then cancelCare() end
+    if careScheduler.Count("pet")>0 then
+        if not petHandover then cancelCare("pet") end
         petHandover={unique=desired}
         notify("Yumurta / pet değişimi · mevcut bakım temizleniyor.")
         return true
@@ -2978,7 +3055,7 @@ local function tickCare()
         return
     end
     if not transport.isReady() then notify(transport.snapshot().status);return end
-    if tickPetChoice() then return end
+    if tickPetChoice() and not petHandover then return end
     -- A task from an older build or a manually entered seat may have no worker
     -- left to release it. Recover before scheduling the next baby action.
     if autoBaby and not careScheduler.IsReserved("actor:baby") then
@@ -3012,9 +3089,10 @@ local function tickCare()
         return
     end
     if data("roleplay_role") then notify("Aktif iş bitene kadar bakım bekliyor."); return end
-    if autoPets and selectedItem() and not selectedWrapper() then
-        if careScheduler.Count() > 0 then cancelCare(); return end
-        api.equipSelected(); return
+    if autoPets and not petHandover and selectedItem() and not selectedWrapper() then
+        if careScheduler.Count("pet") > 0 then cancelCare("pet"); return end
+        if careScheduler.IsReserved("tools")then return end
+        runAction(function()equip();notify("Otomatik seçilen pet takıldı.")end,"pet"); return
     end
     if stationMode and not stationInitialized then
         if voidMode then
@@ -3062,7 +3140,7 @@ local function tickCare()
     end
     stationWaiting = {}
     local rows = {}
-    if autoPets then for _, row in ipairs(ailments()) do table.insert(rows, row) end end
+    if autoPets and not petHandover then for _, row in ipairs(ailments()) do table.insert(rows, row) end end
     if autoBaby then for _, row in ipairs(ailments("baby")) do table.insert(rows, row) end end
     local priority = {mystery = 0, sick = 1, dirty = 2, bored=2, camping=2, beach_party=2, party_zone=2, sleepy = 3, hungry = 4, thirsty = 4,
         toilet = 5, pet_me = 6, play = 10, walk = 9, ride = 8}
@@ -3108,8 +3186,9 @@ local function stopVoidFarm()
 end
 
 function api.setAutoPets(value)
+    if autoPets==(value==true)then return end
     local starting=value==true and not autoPets
-    cancelCare(); stopGuide()
+    cancelCare("pet"); stopGuide()
     autoPets, autoVenues, venueState = value == true, false, nil
     if starting then petChoice.Reset();petHandover=nil end
     if not autoPets and not autoBaby then stopVoidFarm()end
@@ -3117,7 +3196,8 @@ function api.setAutoPets(value)
     wakeCare()
 end
 function api.setAutoBaby(value)
-    cancelCare(); stopGuide()
+    if autoBaby==(value==true)then return end
+    cancelCare("baby"); stopGuide()
     autoBaby, autoVenues, venueState = value == true, false, nil
     if not autoPets and not autoBaby then stopVoidFarm()end
     notify(autoBaby and "Bebek rolü ve görev otomasyonu açık." or "Bebek bakımı kapalı.")
@@ -3278,7 +3358,8 @@ function api.snapshot()
         petEquipPending=petEquipTarget~=nil,
         autoPets = autoPets, autoBaby = autoBaby, babyTasks = babyRows, team = data("team"),
         careState = careScheduler.Snapshot()[1], careJobs = careScheduler.Snapshot(),
-        activeCareJobs = careScheduler.Count(), peakCareJobs = careScheduler.peak, schedulerVersion = 11,
+        activeCareJobs = careScheduler.Count(), peakCareJobs = careScheduler.peak, schedulerVersion = 12,
+        waitingCareJobs = careScheduler.waiting,
         voidFarm=voidFarm and voidFarm.active or false,logicalLocation=voidFarm and voidFarm.context,
         platformArea=voidFarm and voidFarm.area,platformPosition=platformCF.Position,
         remoteHouseError=api.remoteHouseError,
@@ -9646,11 +9727,14 @@ local ok,err=xpcall(function()
         local lines={string.format("%d aktif / en fazla 6 paralel iş",snap.activeCareJobs)}
         local active={}
         for _,job in ipairs(snap.careJobs) do active[job.target..":"..job.key]=job end
+        local waiting={}
+        for _,job in ipairs(snap.waitingCareJobs or {})do waiting[job.target..":"..job.key]=job.reason end
         for _,list in ipairs({{rows=snap.tasks,name="Pet"},{rows=snap.babyTasks,name="Bebek"}}) do
             for _,row in ipairs(list.rows) do
                 local job=active[(list.name=="Pet" and "pet" or "baby")..":"..row.key]
                 table.insert(lines,list.name.." · "..care.taskName(row.kind).." · %"..math.floor(row.progress*100).." · "..
-                    (job and (job.mode=="observe" and "İlerliyor" or job.stage) or snap.stationWaiting[row.kind] or "Sırada"))
+                    (job and (job.mode=="observe" and "İlerliyor" or job.stage) or
+                        waiting[(list.name=="Pet" and "pet" or "baby")..":"..row.key] or snap.stationWaiting[row.kind] or "Sırada"))
             end
         end
         setText(jobs,table.concat(lines,"\n"));setText(notice,(snap.pauseReason or snap.lastError or snap.notice or "Hazır")..string.format("\nSu alımı: %d + %d ayrılan / %d Bucks",snap.waterSpent,snap.waterReserved or 0,snap.waterBudget))
