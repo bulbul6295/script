@@ -30,7 +30,7 @@ if env.BulbulComebackLoad and env.BulbulComebackLoad.inProgress then
     warn("[bülbül comeback] Menü yüklemesi devam ediyor; tamamlanmasını bekle.")
     return env.BulbulComeback
 end
-local report={ready=false,stage="Başlatılıyor",build="transport-auto-register-11"}
+local report={ready=false,stage="Başlatılıyor",build="bucks-remote-discovery-12"}
 report.inProgress=true
 env.BulbulComebackLoad=report
 local previousCare=env.AdoptMeCompanion
@@ -597,14 +597,19 @@ return function()
     local env=getgenv and getgenv() or _G
     local player=game.Players.LocalPlayer
     local old=env.AdoptMeTransportActive
-    if old and old.owner==player.UserId and old.server==game.JobId then return old end
+    if old and old.owner==player.UserId and old.server==game.JobId then
+        if type(old.isReady)=="function" and type(old.inspect)=="function"then return old end
+        local busy=old.active~=nil
+        if type(old.isBusy)=="function"then busy=busy or old.isBusy()end
+        assert(not busy,"Önceki konum işlemi henüz bitmedi; menüyü işlem tamamlanınca yeniden yükle.")
+    end
     local newGuard=(function()
 -- All callers share one native transport lease, including late responses.
 return function(ctx)
     local guard={active=nil,status="Konum hazır",stalls=0,completed=0,sequence=0,history={}}
     local function record(kind,a)
         guard.history[#guard.history+1]={kind=kind,time=ctx.Now(),destination=a.destination,ownerId=a.ownerId,
-            sequence=a.sequence,error=guard.error}
+            operation=a.operation,phase=a.phase,sequence=a.sequence,error=guard.error}
         if #guard.history>30 then table.remove(guard.history,1)end
         if ctx.Record then pcall(ctx.Record,guard.history)end
     end
@@ -626,7 +631,7 @@ return function(ctx)
     function guard.snapshot()
         local a=guard.active
         return {pending=a~=nil,destination=a and a.destination,ownerId=a and a.ownerId,started=a and a.started,
-            phase=a and a.phase,status=guard.status,error=guard.error,stalls=guard.stalls,completed=guard.completed,
+            phase=a and a.phase,operation=a and a.operation,status=guard.status,error=guard.error,stalls=guard.stalls,completed=guard.completed,
             last=guard.last,
             busyFor=a and math.max(0,ctx.Now()-a.started) or 0}
     end
@@ -645,11 +650,62 @@ return function(ctx)
         local a=guard.active
         if a and ctx.Now()-a.started>=45 and not a.stalled then
             a.stalled=true;guard.stalls+=1
-            guard.status="Konum geçişi uzadı · yeni geçişler bekletiliyor"
+            guard.status="Konum işlemi uzadı · yeni geçişler bekletiliyor"
             record("stalled",a)
         end
         -- A timeout never releases an unfinished native call or its generation.
         return guard.snapshot()
+    end
+    function guard.inspect(callback,valid)
+        assert(type(callback)=="function","Ev inceleme işlemi hazır değil.")
+        local queueDeadline=ctx.Now()+25
+        local origin
+        while true do
+            assert(validNow(valid),"Ev incelemesi iptal edildi.")
+            local r=read()
+            assert(not r.forced,"Mini oyun sırasında ev incelemesi başlatılmaz.")
+            if not guard.active and not r.externalBusy and r.loaded==true and r.characterReady==true and
+                r.destination~=nil and (r.destination~="housing" or r.ownerId~=nil)then
+                origin={destination=r.destination,ownerId=r.ownerId}
+                break
+            end
+            assert(ctx.Now()<queueDeadline,"Ev incelemesi için önceki konumun yüklenmesi bekleniyor.")
+            ctx.Wait(0.1)
+        end
+        assert(validNow(valid),"Ev incelemesi iptal edildi.")
+        guard.sequence+=1
+        local a={destination=origin.destination,ownerId=origin.ownerId,operation="inspection",
+            started=ctx.Now(),phase="inspection",sequence=guard.sequence}
+        guard.active=a;guard.error=nil;guard.status="Ev kasası konum değiştirmeden inceleniyor"
+        record("inspection_started",a)
+        -- The callback owns native subscription cleanup. It runs synchronously:
+        -- a watchdog or cancelled token cannot release its live invocation.
+        local packed=table.pack(pcall(callback,origin))
+        a.phase="scene"
+        local settled,r=pcall(function()
+            local deadline=ctx.Now()+20
+            while true do
+                local current=read()
+                if matches(a,current)then return current end
+                -- Even a cancelled caller must let its origin scene settle.
+                assert(ctx.Now()<deadline,"Ev incelemesi sonrası önceki konum doğrulanamadı.")
+                ctx.Wait(0.1)
+            end
+        end)
+        local validOK,validResult=pcall(validNow,valid)
+        local resultOK=packed[1] and type(packed[2])=="table"
+        if guard.active==a then guard.active=nil end
+        if not packed[1]then guard.error=tostring(packed[2]);guard.status="Ev incelemesi hata verdi"
+        elseif not settled then guard.error=tostring(r);guard.status="Önceki konumun yüklenmesi bekleniyor"
+        elseif not validOK then guard.error=tostring(validResult);guard.status="Ev incelemesi iptal edildi"
+        elseif not validResult then guard.error="Ev incelemesi iptal edildi.";guard.status="Ev incelemesi iptal edildi"
+        elseif not resultOK then guard.error="Ev inceleme sonucu geçersiz.";guard.status="Ev incelemesi hata verdi"
+        else guard.completed+=1;guard.status="Konum hazır";guard.error=nil end
+        guard.last={destination=a.destination,ownerId=a.ownerId,operation=a.operation,error=guard.error,time=ctx.Now()}
+        record(guard.error and "inspection_error" or "inspection_settled",a)
+        assert(packed[1],packed[2]);assert(settled,r);assert(validOK,validResult)
+        assert(validResult,"Ev incelemesi iptal edildi.");assert(resultOK,"Ev inceleme sonucu geçersiz.")
+        return packed[2]
     end
     function guard.enter(destination,door,options,valid)
         options=options or {}
@@ -699,6 +755,7 @@ end
     end)()
     local load=require(game.ReplicatedStorage.Fsys).load
     local Interiors,Door,Forced=load("InteriorsM"),load("Door"),load("MinigameForcedState")
+    local CD,Store=load("ClientData"),load("ClientStore")
     local guard=newGuard({Now=os.clock,Wait=task.wait,
         Record=function(events)
             if type(writefile)=="function" then
@@ -719,12 +776,25 @@ end
             local root=character and character:FindFirstChild("HumanoidRootPart")
             local interior=loc and loc.interior
             local map=loc and loc.destination_id=="MainMap" and workspace:FindFirstChild("StaticMap") or nil
+            local loaded=interior~=nil and (interior==workspace or interior.Parent~=nil) or map~=nil and map.Parent~=nil
+            if loc and loc.destination_id=="housing"then
+                local owner=loc.house_owner
+                local data=CD.get("house_interior")
+                local rendered=Store.store:getState().house_interior
+                local folder=workspace:FindFirstChild("HouseInteriors")
+                local blueprint=folder and folder:FindFirstChild("blueprint")
+                local model=blueprint and blueprint:GetChildren()[1]
+                -- A rendered owner match cannot repair a native location whose
+                -- interior/door/interactions still reference a destroyed model.
+                loaded=loaded and owner~=nil and data~=nil and data.player==owner and
+                    rendered~=nil and rendered.player==owner and model~=nil and model.Name==owner.Name and model.Parent~=nil
+            end
             return {destination=loc and loc.destination_id,ownerId=loc and loc.house_owner and loc.house_owner.UserId,
-                loaded=interior~=nil and (interior==workspace or interior.Parent~=nil) or map~=nil and map.Parent~=nil,
+                loaded=loaded==true,
                 characterReady=root~=nil and root.Parent~=nil,externalBusy=Door.entering_door==true,
                 forced=Forced.is_enabled()}
         end})
-    guard.owner,guard.server=player.UserId,game.JobId
+    guard.owner,guard.server,guard.version=player.UserId,game.JobId,2
     env.AdoptMeTransportActive=guard
     task.spawn(function()
         while env.AdoptMeTransportActive==guard do
@@ -3049,8 +3119,8 @@ return function(ctx, previous)
             assert(state.running and not state.busy,"Önce mevcut ödeme isteğinin bitmesini bekle.")
             assert(state.targetId and ctx.Resolve(state.targetId),"Önce hedef oyuncuyu seç.")
             assert(state.limit==0 or state.reserved<state.limit,"Toplam limit doldu; limiti yükselt veya sayacı sıfırla.")
-            local allowed,reason=ctx.Allowed();assert(allowed,reason)
-            state.error=nil;state.nextAt=ctx.Now();state.status="Hedefin kasası hazırlanıyor"
+            local allowed,reason,_,waitable=ctx.Allowed();assert(allowed or waitable==true,reason)
+            state.error=nil;state.nextAt=ctx.Now();state.status=allowed and "Hedefin kasası hazırlanıyor" or reason
         else state.status=state.busy and "Mevcut istek bitince duracak" or "Kapalı" end
         state.enabled=value==true;state.epoch+=1;save()
     end
@@ -3074,9 +3144,15 @@ return function(ctx, previous)
         if state.pauseReason then state.status=state.pauseReason;return end
         if ctx.Now()<state.nextAt then return end
         local target=ctx.Resolve(state.targetId)
-        if not target then state.enabled=false;state.status="Hedef oyuncu sunucudan ayrıldı";save();return end
-        local allowed,reason=ctx.Allowed()
-        if not allowed then state.status=reason or "Ödeme şu anda kullanılamıyor";state.nextAt=ctx.Now()+60;return end
+        if not target then
+            state.status="Hedef oyuncunun sunucuya dönmesi bekleniyor";state.nextAt=ctx.Now()+15;save();return
+        end
+        local allowed,reason,retryDelay=ctx.Allowed()
+        if not allowed then
+            state.status=reason or "Ödeme şu anda kullanılamıyor"
+            state.nextAt=ctx.Now()+(type(retryDelay)=="number" and math.clamp(retryDelay,1,60)or 60)
+            return
+        end
         local remaining=state.limit==0 and state.amount or state.limit-state.reserved
         local known,balance=pcall(ctx.Balance)
         if not known or type(balance)~="number" or balance~=balance or balance>=math.huge or balance<0 then
@@ -3084,7 +3160,9 @@ return function(ctx, previous)
         end
         local amount=math.floor(math.min(state.amount,remaining,balance-state.reserve))
         if amount<1 then
-            state.enabled=false;state.status=remaining<1 and "Toplam limit tamamlandı" or "Bakiye alt sınırına ulaşıldı";save();return
+            if remaining<1 then state.enabled=false;state.status="Toplam limit tamamlandı"
+            else state.status="Yeni Bucks kazanılması bekleniyor";state.nextAt=ctx.Now()+15 end
+            save();return
         end
         state.busy=true;state.busySince=ctx.Now();local token=state.epoch
         local function valid()return state.running and state.enabled and not state.pauseReason and token==state.epoch end
@@ -3114,8 +3192,15 @@ return function(ctx, previous)
                         state.confirmed+=amount;batchConfirmed+=amount;state.error=nil;sent=false;save()
                     elseif receipt and receipt.rejected then
                         state.reserved-=amount;sent=false;save();break
+                    elseif receipt and receipt.notSent then
+                        -- Local validation failed before InvokeServer. This is
+                        -- known not to have spent money, so never keep a false
+                        -- uncertain reservation or require a manual restart.
+                        state.reserved-=amount;sent=false;save()
+                        error(receipt.error or "Ödeme koşulları henüz hazır değil.")
                     else break end
-                    if index<state.batchCount and ctx.Wait then ctx.Wait(0.25)end
+                    -- The native invocation and exact debit are already the
+                    -- barrier. Begin the next payment as soon as both finish.
                 end
             end)
             state.stage="Konuma dönülüyor"
@@ -3145,6 +3230,163 @@ return function(ctx, previous)
     state.attempts=number(state.attempts,0,1e12)
     if state.targetId~=nil then state.targetId=number(state.targetId,1,1e15) end
     return state
+end
+
+    end)()
+    local newHouseReader=(function()
+-- Inspect a remote house while retaining the native transport lease through cleanup.
+return function(ctx)
+    local reader={blocked=false}
+    local function isTargetHouse(house,target)
+        return type(house)=="table" and house.player==target and house.house_id~=nil and
+            type(house.furniture)=="table"
+    end
+    local function append(errors,ok,err)
+        if not ok then errors[#errors+1]=tostring(err)end
+    end
+    function reader.discover(target,valid)
+        assert(not reader.blocked,"Önceki ev aboneliğinin temizlendiği doğrulanamadı.")
+        return ctx.Inspect(function()
+            -- Recheck after acquiring the shared lease: an earlier queued request may fail cleanup.
+            assert(not reader.blocked,"Önceki ev aboneliğinin temizlendiği doğrulanamadı.")
+            ctx.Check(valid)
+            local current=ctx.Current()
+            assert(type(current)=="table" and current.destination~=nil,"Mevcut konum okunamadı.")
+            local origin={destination=current.destination,owner=current.owner,houseId=current.houseId}
+            local house=ctx.Read()
+            if isTargetHouse(house,target)then return {house=house,loaded=true}end
+
+            local attempted,release=false,nil
+            local fetched,result=pcall(function()
+                release=ctx.Pin(origin)
+                assert(type(release)=="function","Önceki ev verisi korunamadı.")
+                ctx.Check(valid)
+                attempted=true -- A partially applied Subscribe that throws still requires cleanup.
+                ctx.Subscribe(target)
+                local deadline=ctx.Now()+10
+                while true do
+                    ctx.Check(valid)
+                    local data=ctx.Read()
+                    if isTargetHouse(data,target)then return data end
+                    assert(ctx.Now()<deadline,"Hedef evin mobilya verisi yüklenemedi.")
+                    ctx.Wait(0.1)
+                end
+            end)
+
+            local cleanupErrors={}
+            if attempted then
+                -- These calls deliberately ignore cancellation and forced-state changes. A pending
+                -- native invocation keeps the shared Inspect lease until it actually returns.
+                local ok,err=pcall(ctx.Unsubscribe,target)
+                append(cleanupErrors,ok,err)
+                if origin.destination=="housing" then
+                    ok,err=pcall(ctx.Subscribe,origin.owner)
+                    append(cleanupErrors,ok,err)
+                end
+                ok,err=pcall(function()
+                    local deadline=ctx.Now()+20
+                    while not ctx.Restored(origin)do
+                        assert(ctx.Now()<deadline,"Önceki ev aboneliği geri yüklenemedi.")
+                        ctx.Wait(0.1)
+                    end
+                end)
+                append(cleanupErrors,ok,err)
+            end
+            if release then
+                local ok,err=pcall(release)
+                append(cleanupErrors,ok,err)
+            end
+            if #cleanupErrors>0 then
+                reader.blocked=true
+                reader.error=table.concat(cleanupErrors," · ")
+                error("Ev aboneliği temizlenemedi · "..reader.error,0)
+            end
+            if not fetched then error(result,0)end
+            return {house=result,loaded=true}
+        end,valid)
+    end
+    return reader
+end
+
+    end)()
+    local newRegisterDialog=(function()
+-- Answer only a native cash-register rejection, completing its dialog ticket.
+-- Hiding DialogApp would leave the native waiter and server request yielded.
+return function(ctx)
+    local messages={
+        {"This register seems overloaded right now! Try again later.","overloaded"},
+        {"The maximum you can pay is $50!","maximum"},
+        {"Please enter an amount greater than zero!","nonpositive"},
+    }
+    local known,okay={}, {["Okay"]=true}
+    local function translated(raw)
+        if not ctx.Translate then return end
+        local ok,value=pcall(ctx.Translate,raw)
+        if ok and type(value)=="string" and value~=""then return value end
+    end
+    for _,row in ipairs(messages)do
+        known[row[1]]=row[2]
+        local text=translated(row[1]);if text then known[text]=row[2]end
+    end
+    local okayText=translated("Okay");if okayText then okay[okayText]=true end
+    local helper,lastResponded={},nil
+    local function integer(value)
+        return type(value)=="number" and value==value and value<math.huge and value>=0 and value==math.floor(value)
+    end
+    local function current()
+        local app=ctx.App()
+        if not app or app.visible~=true then return end
+        local dialog=app.instance and app.instance:FindFirstChild("Dialog")
+        if not dialog or dialog.Visible~=true then return end
+        local normal=dialog:FindFirstChild("NormalDialog")
+        if not normal or normal.Visible~=true then return end
+        local info=normal:FindFirstChild("Info")
+        if not info or info.Visible~=true then return end
+        local label=info and info:FindFirstChild("TextLabel")
+        if not label or not label:IsA("TextLabel") or label.Visible~=true then return end
+        local reason=known[label.Text]
+        if not reason then return end
+        local buttons=normal:FindFirstChild("Buttons")
+        if not buttons or buttons.Visible~=true then return end
+        local count,button=0,nil
+        for _,child in ipairs(buttons:GetChildren())do
+            if child:IsA("ImageButton") and child.Visible==true then
+                count+=1;button=child
+            end
+        end
+        if count~=1 then return end
+        local face=button:FindFirstChild("Face")
+        if not face or face.Visible~=true then return end
+        local buttonLabel=face and face:FindFirstChild("TextLabel")
+        if not buttonLabel or not buttonLabel:IsA("TextLabel") or buttonLabel.Visible~=true or not okay[buttonLabel.Text]then return end
+        if not integer(app.completed_ticket) or not integer(app.ticket_count) or app.completed_ticket>=app.ticket_count then return end
+        local signal=app.force_response_signal
+        if not signal or type(signal.Fire)~="function"then return end
+        return {ticket=app.completed_ticket+1,text=label.Text,reason=reason,app=app,
+            normal=normal,label=label,button=button}
+    end
+    function helper.inspect()
+        local ok,record=pcall(current)
+        return ok and record or nil
+    end
+    function helper.ticket()
+        local ok,app=pcall(ctx.App)
+        if ok and app and integer(app.completed_ticket)then return app.completed_ticket end
+    end
+    function helper.dismiss(record)
+        record=record or helper.inspect()
+        if not record then return false end
+        local now=helper.inspect()
+        if not now or now.app~=record.app or now.ticket~=record.ticket or now.text~=record.text or
+            now.normal~=record.normal or now.label~=record.label or now.button~=record.button then return false end
+        if lastResponded and lastResponded.app==now.app and lastResponded.ticket==now.ticket then return false end
+        -- Native queue_with_override uses this packed response for this exact
+        -- ticket. Keep the latch during cleanup; never answer queued tickets.
+        lastResponded={app=now.app,ticket=now.ticket}
+        local ok=pcall(function()now.app.force_response_signal:Fire(now.ticket,table.pack("Okay"))end)
+        return ok
+    end
+    return helper
 end
 
     end)()
@@ -3187,6 +3429,21 @@ end
     local function ownerIs(loc,target)
         return loc and loc.destination_id=="housing" and loc.house_owner and loc.house_owner.UserId==target.UserId
     end
+    local function readRegister(target,house)
+        if not house or house.player~=target or type(house.furniture)~="table"then return end
+        local choices={}
+        for unique,item in pairs(house.furniture)do
+            if type(item)=="table" and (item.id=="cashregister" or item.id=="golden_cash_register")then
+                choices[#choices+1]={unique=unique,blockName="UseBlock",owner=target.UserId,
+                    houseId=house.house_id,observedAt=os.clock()}
+            end
+        end
+        table.sort(choices,function(a,b)return tostring(a.unique)<tostring(b.unique)end)
+        -- This dictionary and both UseBlock names were verified against the
+        -- native HouseInterior renderer and current CashRegister models.
+        cache.registers[target.UserId]=choices[1]
+        return choices[1]
+    end
     local function findRegister(target)
         local loc=location();if not ownerIs(loc,target)then return end
         local choices={}
@@ -3209,32 +3466,69 @@ end
         table.sort(choices,function(a,b)return tostring(a.unique)<tostring(b.unique)end)
         local found=choices[1]
         if found then
-            cache.registers[target.UserId]={unique=found.unique,blockName=found.block.Name,owner=target.UserId}
+            local house=CD.get("house_interior")
+            cache.registers[target.UserId]={unique=found.unique,blockName=found.block.Name,owner=target.UserId,
+                houseId=house and house.player==target and house.house_id or nil,observedAt=os.clock()}
         end
         return found
     end
-    local function rejection()
-        local dialog=load("UIManager").apps.DialogApp
-        if not dialog.visible then return false end
-        for _,label in ipairs(dialog.instance:GetDescendants())do
-            if label:IsA("TextLabel")then
-                local text=label.Text:lower()
-                if text:find("register seems overloaded",1,true)or text:find("maximum you can pay",1,true)or
-                    text:find("please enter an amount greater",1,true)then return true end
-            end
-        end
-        return false
+    local function houseRestored(origin)
+        local current=location()
+        if not current or current.destination_id~=origin.destination or current.house_owner~=origin.owner then return false end
+        local house=CD.get("house_interior")
+        if origin.destination~="housing"then return not house or house.player==nil end
+        if not house or house.player~=origin.owner or house.house_id~=origin.houseId then return false end
+        local store=load("ClientStore").store:getState().house_interior
+        if not store or store.player~=origin.owner or store.house_id~=origin.houseId then return false end
+        local interiors=workspace:FindFirstChild("HouseInteriors")
+        local blueprint=interiors and interiors:FindFirstChild("blueprint")
+        return blueprint and blueprint:FindFirstChild(origin.owner.Name)~=nil
     end
+    local houseReader=newHouseReader({Now=os.clock,Wait=task.wait,Check=check,
+        Inspect=function(callback,valid)
+            assert(care.transport and care.transport.inspect,"Ev verisi koordinatörü hazır değil; güncel paketi yeniden yükle.")
+            return care.transport.inspect(callback,valid)
+        end,
+        Current=function()
+            local loc=assert(location(),"Konum bilgisi hazır değil.")
+            local house=CD.get("house_interior")
+            return {destination=loc.destination_id,owner=loc.house_owner,
+                houseId=house and house.house_id}
+        end,
+        Read=function()return CD.get("house_interior")end,
+        Subscribe=function(owner)Router.get("HousingAPI/SubscribeToHouse"):FireServer(owner)end,
+        Unsubscribe=function(owner)Router.get("HousingAPI/UnsubscribeFromHouse"):InvokeServer(owner)end,
+        Restored=houseRestored,
+        Pin=function(origin)
+            -- Unsubscribing destroys a house blueprint and native Location's
+            -- door/interior bindings. Do not replace an occupied house scene.
+            assert(origin.destination~="housing","Kasa bilgisi için farmın doğal ev dışı görevi bekleniyor.")
+            return function()end
+        end})
+    local translator
+    pcall(function()translator=game:GetService("LocalizationService"):GetTranslatorForPlayer(player)end)
+    local registerDialog=newRegisterDialog({App=function()return load("UIManager").apps.DialogApp end,
+        Translate=function(raw)return translator and translator:Translate(workspace,raw)or raw end})
+    local function rejection()return registerDialog.inspect()end
     local previous=env.BulbulBucksPrefs
     if previous and previous.ownerId~=player.UserId then previous=nil end
     local transfer
     transfer=newLoop({Now=os.clock,Spawn=task.spawn,Resolve=resolve,Balance=balance,Wait=task.wait,
         Save=function(prefs)prefs.ownerId=player.UserId;env.BulbulBucksPrefs=prefs end,
         Allowed=function()
-            if care.transport and not care.transport.isReady()then return false,"Konum yüklenirken ödeme bekliyor"end
-            if Forced.is_enabled()then return false,"Mini oyun sırasında ödeme bekliyor"end
+            if care.transport and not care.transport.isReady()then return false,"Konum yüklenirken ödeme bekliyor",1,true end
+            if Forced.is_enabled()then return false,"Mini oyun sırasında ödeme bekliyor",5,true end
             local disabled,reason=Policy.is_all_trading_disabled()
             if disabled then return false,reason or "Oyuncular arası işlem şu anda kapalı"end
+            local target=transfer and resolve(transfer.targetId)
+            local loc=location()
+            local cached=target and cache.registers[target.UserId]
+            if transfer and transfer.remoteOnly and target and loc and loc.destination_id=="housing" and
+                not ownerIs(loc,target) and not cached then
+                return false,"İlk kasa sorgusu için farmın doğal ev dışı görevi bekleniyor",1,true
+            end
+            local dialog=load("UIManager").apps.DialogApp
+            if dialog.visible and not rejection()then return false,"Açık oyun penceresinin kapanması bekleniyor",5,true end
             return true
         end,
         Acquire=function(valid)
@@ -3246,6 +3540,7 @@ end
             beforeLocation=loc and {id=loc.destination_id,owner=loc.house_owner,
                 pivot=character and character:GetPivot()}or nil
             register=nil;transportStarted=false;care.setPaused(pauseText);ownsPause=true
+            assert(not houseReader.blocked,"Önceki ev verisi temizliği doğrulanamadı; aktarım durdu.")
             local deadline=os.clock()+30
             while care.snapshot().busy or care.snapshot().activeCareJobs>0 do
                 check(valid);assert(os.clock()<deadline,"Bakım temizliği henüz bitmedi; aktarım bekleyecek.");task.wait(0.15)
@@ -3255,41 +3550,22 @@ end
         Prepare=function(target,valid)
             check(valid)
             if transfer.remoteOnly then
+                local house=CD.get("house_interior")
+                if house and house.player==target then readRegister(target,house)end
                 findRegister(target)
                 register=cache.registers[target.UserId]
-                if not register then
-                    transfer.status="Hedefin kasası otomatik bulunuyor · ilk ev ziyareti"
-                    if not ownerIs(location(),target)then
-                        transportStarted=true
-                        enter("housing","MainDoor",{house_owner=target},valid)
-                    end
-                    check(valid);assert(ownerIs(location(),target),"Hedefin evine girilemedi; ev kilitli olabilir.")
-                    local deadline=os.clock()+8
-                    repeat
-                        check(valid);findRegister(target);register=cache.registers[target.UserId]
-                        if register then break end
-                        task.wait(0.2)
-                    until os.clock()>=deadline
+                local current=location()
+                local mayRefresh=current and current.destination_id~="housing"
+                if not register or mayRefresh and (not register.observedAt or os.clock()-register.observedAt>=300)then
+                    transfer.status="Hedefin kasa bilgisi uzaktan alınıyor"
+                    local data=houseReader.discover(target,valid)
+                    check(valid)
+                    register=readRegister(target,data.house)
                     if not register then
                         transfer.setEnabled(false)
-                        transfer.status="Hedefin kasası yüklenemedi veya kasa yok · aktarım durdu"
+                        transfer.status="Hedefin evinde ödeme kasası yok · aktarım durdu"
                         error(transfer.status)
                     end
-                    check(valid)
-                    if transportStarted and beforeLocation and beforeLocation.id then
-                        local current=location()
-                        if not current or current.destination_id~=beforeLocation.id or current.house_owner~=beforeLocation.owner then
-                            enter(beforeLocation.id,"MainDoor",beforeLocation.owner and {house_owner=beforeLocation.owner}or {},valid)
-                        end
-                        check(valid)
-                        local character=player.Character
-                        if character and beforeLocation.pivot then
-                            character:PivotTo(beforeLocation.pivot)
-                            local root=character:FindFirstChild("HumanoidRootPart")
-                            if root then root.AssemblyLinearVelocity=Vector3.zero end
-                        end
-                    end
-                    transportStarted=false
                 end
                 assert(register and register.owner==target.UserId,"Hedefin kasa kimliği doğrulanamadı.")
                 return
@@ -3313,28 +3589,62 @@ end
             wait(0.5,valid)
         end,
         Pay=function(target,amount,valid)
-            check(valid)
-            if transfer.remoteOnly then
-                assert(register and register.owner==target.UserId and cache.registers[target.UserId]==register,"Kayıtlı kasa değişti.")
-            else
-                assert(ownerIs(location(),target) and register and register.model.Parent and
-                    Tracker.get_furniture_by_unique(register.unique)==register.model,"Ödeme kasası veya ev sahibi değişti.")
-            end
-            assert(resolve(target.UserId)==target,"Hedef oyuncu ayrıldı.")
-            assert(not rejection(),"Önce kasanın önceki ödeme uyarısını kapat.")
-            activeDebit={last=balance(),matched=false,amount=amount}
-            local paid,payError=pcall(function()
-                Router.get("HousingAPI/ActivateFurniture"):InvokeServer(target,register.unique,register.blockName or register.block.Name,amount,player.Character)
+            local ready,reason=pcall(function()
+                check(valid)
+                if transfer.remoteOnly then
+                    assert(register and register.owner==target.UserId and cache.registers[target.UserId]==register,"Kayıtlı kasa değişti.")
+                else
+                    assert(ownerIs(location(),target) and register and register.model.Parent and
+                        Tracker.get_furniture_by_unique(register.unique)==register.model,"Ödeme kasası veya ev sahibi değişti.")
+                end
+                assert(resolve(target.UserId)==target,"Hedef oyuncu ayrıldı.")
             end)
+            if not ready then activeDebit=nil;return {notSent=true,error=tostring(reason)}end
+            local oldRejection=rejection()
+            if oldRejection then
+                registerDialog.dismiss(oldRejection)
+                local deadline=os.clock()+2
+                while rejection() and os.clock()<deadline do task.wait(0.1)end
+                if rejection()then return {rejected=true,notSent=true}end
+            end
+            if load("UIManager").apps.DialogApp.visible then return {notSent=true,error="Oyun penceresinin kapanması bekleniyor."}end
+            local known,funds=pcall(balance)
+            if not known then return {notSent=true,error=tostring(funds)}end
+            local ticket=registerDialog.ticket()
+            if not ticket then return {notSent=true,error="Ödeme uyarısı izleyicisi henüz hazır değil."}end
+            local debit={last=funds,matched=false,amount=amount,rejected=false,ticket=ticket,sent=false}
+            activeDebit=debit
+            -- A rejected InvokeServer may itself await the native Okay response.
+            -- Respond only to the active, exact cash-register error while this
+            -- one request owns the payment lease; never hide a dialog or advance
+            -- a queued ticket. The worker remains busy until InvokeServer returns.
+            task.spawn(function()
+                while activeDebit==debit do
+                    local dialog=rejection()
+                    if debit.sent and dialog and dialog.ticket>debit.ticket then
+                        debit.rejected=true
+                        pcall(registerDialog.dismiss,dialog)
+                    end
+                    task.wait(0.1)
+                end
+            end)
+            local paid,payError=pcall(function()
+                local remote=Router.get("HousingAPI/ActivateFurniture")
+                check(valid)
+                debit.sent=true
+                remote:InvokeServer(target,register.unique,register.blockName or register.block.Name,amount,player.Character)
+            end)
+            if not paid and not debit.sent then activeDebit=nil;return {notSent=true,error=tostring(payError)}end
             local deadline=os.clock()+4
-            while paid and not activeDebit.matched and not rejection() and os.clock()<deadline do task.wait(0.1)end
-            local receipt={confirmed=activeDebit.matched,rejected=not activeDebit.matched and rejection()}
+            while paid and not debit.matched and not debit.rejected and os.clock()<deadline do task.wait(0.1)end
+            local receipt={confirmed=debit.matched,rejected=not debit.matched and debit.rejected}
             activeDebit=nil
             assert(paid,payError)
             return receipt
         end,
         Release=function()
             activeDebit=nil
+            assert(not houseReader.blocked,"Ev verisi temizliği doğrulanamadı; bakım duraklatıldı, ödeme gönderilmedi.")
             local restored,restoreError=true,nil
             -- Cancellation invalidates the payment token, but still owns the
             -- return journey. A newer Ghost pause or menu unload owns transport
@@ -7597,12 +7907,12 @@ local ok,err=xpcall(function()
     transferInput("TransferInterval","Ödeme aralığı (60–3600 saniye)","interval",transfer.setInterval)
     transferInput("TransferLimit","Toplam limit (0 = sınırsız)","limit",transfer.setLimit)
     transferInput("TransferReserve","Bakiyede bırakılacak Bucks","reserve",transfer.setReserve)
-    toggle(tabs.transfer,"TransferEnabled","Sürekli para aktar","Seçilen oyuncunun kasasına düzenli ödeme yapar.",function()return transfer.enabled end,transfer.setEnabled)
-    toggle(tabs.transfer,"TransferRemoteOnly","İlk ziyaretten sonra uzaktan ödeme","Kasayı otomatik bulup konumuna döner; sonraki gruplar uzaktan gönderilir. Ayarı değiştirmek için aktarımı durdur.",function()return transfer.remoteOnly end,transfer.setRemoteOnly)
+    toggle(tabs.transfer,"TransferEnabled","Sürekli para aktar","Toplam limit 0 ise sürekli çalışır; yeni Bucks gelince devam eder.",function()return transfer.enabled end,transfer.setEnabled)
+    toggle(tabs.transfer,"TransferRemoteOnly","Kasayı uzaktan bul ve ödeme yap","Evdeysen ilk sorgu ev dışı görevi bekler; ardından her konumdan ödeme dener.",function()return transfer.remoteOnly end,transfer.setRemoteOnly)
     local transferStatus=paragraph(tabs.transfer,"TransferStatus","Aktarım durumu")
     tabs.transfer:CreateButton{Title="Aktarımı durdur",Callback=action(function()transfer.setEnabled(false)end)}
     tabs.transfer:CreateButton{Title="Aktarım sayacını sıfırla",Callback=action(transfer.reset)}
-    tabs.transfer:CreateParagraph("TransferInfo",{Title="Kasa üzerinden toplu Bucks",Content="Kasa bilinmiyorsa hedefin evine bir kez otomatik girer, kasayı bulur ve konumuna döner. Sonraki ödemeler uzaktan gönderilir. Her ödeme en fazla 50 Bucks; gruptaki her kesinti doğrulanınca sıradaki ödeme başlar. Kasa reddederse grup durur ve bekler. Her yüklemede aktarım kapalı başlar."})
+    tabs.transfer:CreateParagraph("TransferInfo",{Title="Kasa üzerinden toplu Bucks",Content="Elle kayıt veya hedef eve ziyaret gerekmez. Evdeyken ilk sorgu doğal ev dışı görevi bekler. Sürekli aktarım için toplam limit 0 seç. Her ödeme en fazla 50 Bucks; kesinti doğrulanınca sıradaki ödeme başlar. Kasa yoğunken bekleyip yeniden dener. Her yüklemede aktarım kapalı başlar."})
     tabs.tools:CreateButton{Title="SimpleSpy'ı aç",Callback=action(function()
         if not env.SimpleSpy or not _G.SimpleSpyExecuted then
             local fn,compileError=loadstring(spySource,"=Bulbul-SimpleSpy");assert(fn,compileError);fn()
