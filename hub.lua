@@ -30,7 +30,7 @@ if env.BulbulComebackLoad and env.BulbulComebackLoad.inProgress then
     warn("[bülbül comeback] Menü yüklemesi devam ediyor; tamamlanmasını bekle.")
     return env.BulbulComeback
 end
-local report={ready=false,stage="Başlatılıyor",build="bulbul-flock-18"}
+local report={ready=false,stage="Başlatılıyor",build="pet-stability-19"}
 report.inProgress=true
 env.BulbulComebackLoad=report
 local previousCare=env.AdoptMeCompanion
@@ -694,8 +694,12 @@ return function(randomIndex)
             chosen=current and current.isEgg and current or previous and previous.isEgg and previous or eggs[1]
             policy.mode="egg"
         elseif #pets>0 then
+            local current=byId[selected]
             local previous=byId[policy.unique]
-            chosen=policy.mode=="pet" and previous and not previous.isEgg and previous or nil
+            -- Respect the actual equipped pet, including a hatch. The previous
+            -- fallback is used only when the current identity is unavailable.
+            chosen=current and not current.isEgg and current or
+                policy.mode=="pet" and previous and not previous.isEgg and previous or nil
             if not chosen then
                 local index=math.clamp(math.floor(randomIndex(1,#pets)),1,#pets)
                 chosen=pets[index]
@@ -883,6 +887,27 @@ return function(ctx)
         end,valid)
     end
     return reader
+end
+
+end)()
+local newPetFurnitureExit=(function()
+-- ActivateFurniture can hold its InvokeServer reply until the seating state exits.
+-- Request exit before waiting for that reply; keep both requests' leases alive.
+return function(ctx)
+    return function(owned)
+        if not owned.pet or owned.petExitStarted and not owned.petExitError then return end
+        owned.petExitStarted=true
+        owned.petExitDone,owned.petExitError=false,nil
+        owned.pending=(owned.pending or 0)+1
+        if owned.exitStage then owned.exitStage("Pet mobilyadan çıkıyor · sunucu yanıtı bekleniyor")end
+        local identity=owned.pet
+        ctx.Spawn(function()
+            local ok,err=pcall(ctx.Exit,identity)
+            owned.petExitError=not ok and tostring(err)or nil
+            owned.petExitDone=true
+            owned.pending-=1
+        end)
+    end
 end
 
 end)()
@@ -1144,6 +1169,8 @@ local transport=transportFactory()
 local StateManager = load("StateManagerClient")
 local AdminAbuse = require(RS.new.modules.AdminAbuse)
 local SharedConstants = load("SharedConstants")
+local beginPetFurnitureExit=newPetFurnitureExit({Spawn=task.spawn,
+    Exit=function(identity)return Router.get("PetAPI/ExitFurnitureUseStates"):InvokeServer(identity)end})
 local hotspots = env.AdoptMeCareHotspots
 require(RS.new.modules.HotspotsByInterior).get_client():andThen(function(value) hotspots = value end)
 
@@ -1161,6 +1188,7 @@ local labels = {
 local alive, busy, autoVenues, autoSwap = true, false, false, false
 local preferEggs,petHandover,actionPending=true,nil,0
 local petChoice=newPetChoice(math.random)
+local petEquipTarget,lastPetEquipAt=nil,-math.huge
 local lastBabySeatCharacter,lastBabySeatAt=nil,0
 local pauseReason,actionRetryAt,actionFailures=nil,0,0
 local autoPets, autoBaby, careEpoch = false, false, 0
@@ -1229,6 +1257,17 @@ end
 local function petInventory()
     return (data("inventory") or {}).pets or {}
 end
+local function equippedPetUnique()
+    local inventory=petInventory()
+    local wrappers=Equipped.get_my_equipped_char_wrappers()
+    local last=(data("last_equipped_pets")or {})[1]
+    for _,wrapper in ipairs(wrappers)do
+        if wrapper.pet_unique==last and inventory[last]then return last end
+    end
+    for _,wrapper in ipairs(wrappers)do
+        if inventory[wrapper.pet_unique]then return wrapper.pet_unique end
+    end
+end
 local function rebuildPets()
     petList = {}
     inventoryEggCount=0
@@ -1246,6 +1285,10 @@ local function rebuildPets()
     local found = false
     for _, entry in ipairs(petList) do
         if entry.unique == selected then found = true end
+    end
+    if not autoPets and not autoVenues and not busy and (not careScheduler or careScheduler.Count()==0)then
+        local actual=equippedPetUnique()
+        if actual then selected=actual;found=true end
     end
     if not found then
         -- A removed/hatching pet must release its old actor/tool leases first.
@@ -1325,13 +1368,25 @@ local function equip()
     local item = selectedItem()
     assert(item, "Pet secilmedi.")
     if selectedWrapper() then return end
-    local permitted, reason = Tools.equip(item)
-    if not permitted or reason then
-        error(type(reason) == "table" and reason.message or "Pet takilamadi.")
+    local target=selected
+    if petEquipTarget then
+        local deadline=os.clock()+15
+        while petEquipTarget and alive and os.clock()<deadline do task.wait(.1)end
+        assert(not petEquipTarget,"Önceki pet takma yanıtı bekleniyor.")
+        if selectedWrapper()then return end
     end
-    local deadline = os.clock() + 12
-    while alive and os.clock() < deadline and not selectedWrapper() do task.wait(0.2) end
-    assert(not alive or selectedWrapper(), "Sunucu peti takmayi dogrulamadi.")
+    petEquipTarget=target
+    local ok,err=xpcall(function()
+        local permitted, reason = Tools.equip(item)
+        if not permitted or reason then
+            error(type(reason) == "table" and reason.message or "Pet takilamadi.")
+        end
+        local deadline = os.clock() + 12
+        while alive and os.clock() < deadline and not selectedWrapper() do task.wait(0.2) end
+        assert(not alive or selectedWrapper(), "Sunucu peti takmayi dogrulamadi.")
+    end,debug.traceback)
+    if petEquipTarget==target then petEquipTarget=nil;lastPetEquipAt=os.clock()end
+    assert(ok,err)
 end
 local function navigate(destination,valid)
     local navigationValid=valid or function()return alive and not pauseReason and not MinigameForcedState.is_enabled()end
@@ -1419,14 +1474,7 @@ local function releaseCare(owned)
     end) end
     if owned.pet then
         if not owned.petExitStarted then
-            owned.petExitStarted=true
-            owned.petExitDone=false;owned.petExitError=nil
-            owned.pending=(owned.pending or 0)+1
-            task.spawn(function()
-                local ok,err=pcall(function()Router.get("PetAPI/ExitFurnitureUseStates"):InvokeServer(owned.pet)end)
-                owned.petExitError=not ok and tostring(err) or nil
-                owned.petExitDone=true;owned.pending-=1
-            end)
+            beginPetFurnitureExit(owned)
         end
         if not owned.petExitDone then
             if owned.exitStage then owned.exitStage("Pet çıkışı · sunucu yanıtı bekleniyor") end
@@ -2544,11 +2592,13 @@ careScheduler = newCareScheduler({Alive = function() return alive end, Token = f
         -- Keep actor/tool/location leases while a cancelled request is outstanding.
         owned.exitStage=function(text)job.stage=text end
         local nextExit=0
+        if owned.pet then beginPetFurnitureExit(owned)end
         while (owned.pending or 0) > 0 do
             if os.clock()-began>35 then job.stage="Geç sunucu yanıtı · kaynaklar güvenli biçimde tutuluyor" end
             if owned.baby and os.clock()>=nextExit then
                 babySeatExit(owned,owned.exitStage);nextExit=os.clock()+2
             end
+            if owned.pet and os.clock()>=nextExit then beginPetFurnitureExit(owned);nextExit=os.clock()+2 end
             task.wait(0.1)
         end
         local function safeRelease()
@@ -2598,7 +2648,9 @@ local function tickPetChoice()
     if not preferEggs or not (autoPets or autoVenues) then return false end
     if busy or pauseReason or MinigameForcedState.is_enabled() or os.clock()<actionRetryAt then return false end
     rebuildPets()
-    local desired=petChoice.Choose(petList,selected)
+    if petEquipTarget then return true end
+    local actual=os.clock()-lastPetEquipAt>=2 and equippedPetUnique()or nil
+    local desired=petChoice.Choose(petList,actual or selected)
     if desired==selected and not petHandover then return false end
     if careScheduler.Count()>0 then
         if not petHandover then cancelCare() end
@@ -2750,8 +2802,10 @@ local function stopVoidFarm()
 end
 
 function api.setAutoPets(value)
+    local starting=value==true and not autoPets
     cancelCare(); stopGuide()
     autoPets, autoVenues, venueState = value == true, false, nil
+    if starting then petChoice.Reset();petHandover=nil end
     if not autoPets and not autoBaby then stopVoidFarm()end
     notify(autoPets and "Pet bakımı event'lerle otomatik." or "Pet bakımı kapalı.")
     wakeCare()
@@ -2915,6 +2969,7 @@ function api.snapshot()
         equipped = selectedWrapper() ~= nil, location = locationId(), tasks = rows,
         autoVenues = autoVenues, autoSwap = autoSwap, busy = busy,actionPending=actionPending,
         preferEggs=preferEggs,eggCount=inventoryEggCount,petChoiceMode=petChoice.mode,petHandover=petHandover~=nil,
+        petEquipPending=petEquipTarget~=nil,
         autoPets = autoPets, autoBaby = autoBaby, babyTasks = babyRows, team = data("team"),
         careState = careScheduler.Snapshot()[1], careJobs = careScheduler.Snapshot(),
         activeCareJobs = careScheduler.Count(), peakCareJobs = careScheduler.peak, schedulerVersion = 9,
@@ -8972,7 +9027,8 @@ local ok,err=xpcall(function()
         local queued=m and m.is_queued==true
         local phase=hub and hub.autoJoin and hub.autoJoin.phase
         local settling=phase=="preparing"or phase=="playing"or phase=="exiting"or phase=="waiting"
-        return {active=active,transition=Forced.is_enabled() or inGame or not ready and (inLobby or queued or active or settling) or false,
+        local inspecting=care.transport.snapshot and care.transport.snapshot().operation=="inspection"
+        return {active=active,transition=Forced.is_enabled() or inGame or not ready and not inspecting and (inLobby or queued or active or settling) or false,
             farmReady=ready and loc~=nil and not inLobby and not inGame and not queued,
             timestamp=cycle and cycle.timestamp,queued=m and m.is_queued,inJoinZone=inJoinZone(),
             loading=m and m.minigame_state:get("players_loading"),canInvite=Forced.can_receive_invites()}
