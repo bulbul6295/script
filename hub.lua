@@ -30,7 +30,7 @@ if env.BulbulComebackLoad and env.BulbulComebackLoad.inProgress then
     warn("[bülbül comeback] Menü yüklemesi devam ediyor; tamamlanmasını bekle.")
     return env.BulbulComeback
 end
-local report={ready=false,stage="Başlatılıyor",build="void-farm-17"}
+local report={ready=false,stage="Başlatılıyor",build="bulbul-flock-18"}
 report.inProgress=true
 env.BulbulComebackLoad=report
 local previousCare=env.AdoptMeCompanion
@@ -1173,6 +1173,7 @@ local stationWaiting = {}
 local stationInitialized, stationRelative, createCareStation = false, nil, nil
 local voidMode=true
 local platformCF=CFrame.new(0,50000,0)
+local platformArt=nil
 local voidFarm,remoteHouse,nextHouseRead=nil,nil,0
 local remoteModels={}
 local careRoutes = {}
@@ -1551,6 +1552,20 @@ local function careNavigate(destination, row, token, settings)
         createCareStation(true)
     end
 end
+local function decoratePlatform()
+    if not platformArt or not careStation or not careStation.Parent then return end
+    local texture=careStation:FindFirstChild("BulbulFlock")
+    if not texture then
+        texture=Instance.new("Texture")
+        texture.Name="BulbulFlock"
+        texture.Face=Enum.NormalId.Top
+        texture.StudsPerTileU,texture.StudsPerTileV=16,16
+        texture.Transparency=0
+        texture.Color3=Color3.new(1,1,1)
+        texture.Parent=careStation
+    end
+    texture.Texture=platformArt
+end
 createCareStation = function(restore)
     if voidMode then
         if careStation and careStation.Parent then return end
@@ -1562,6 +1577,7 @@ createCareStation = function(restore)
         careStation.Transparency=1
         careStation.CanCollide,careStation.CanQuery,careStation.CanTouch=true,true,false
         careStation.Parent=workspace
+        decoratePlatform()
         stationInitialized=true
         return
     end
@@ -2771,6 +2787,11 @@ function api.setStationMode(value)
     wakeCare()
     notify(stationMode and "Sabit BasePart bakımı açık." or "Konumlar arasında normal bakım açık.")
 end
+function api.setPlatformArt(image)
+    assert(type(image)=="string"and #image>0,"Platform görseli hazır değil.")
+    platformArt=image
+    decoratePlatform()
+end
 local function waitCareDrain()
     local deadline=os.clock()+25
     while careScheduler.Count()>0 and os.clock()<deadline do task.wait(0.1) end
@@ -2899,6 +2920,7 @@ function api.snapshot()
         activeCareJobs = careScheduler.Count(), peakCareJobs = careScheduler.peak, schedulerVersion = 9,
         voidFarm=voidFarm and voidFarm.active or false,logicalLocation=voidFarm and voidFarm.context,
         remoteHouseError=api.remoteHouseError,
+        platformBirds=platformArt~=nil and careStation~=nil and careStation.Parent~=nil,
         paused=pauseReason~=nil,pauseReason=pauseReason,recoveries=careScheduler.recoveries,
         stationMode = stationMode, stationReady = careStation ~= nil and careStation.Parent ~= nil,
         stationLocation = stationLocation, stationWaiting = stationWaiting,
@@ -8725,7 +8747,8 @@ return function(ui,window,hub)
             if not (type(isfile)=="function" and isfile(path))then writefile(path,decode(encoded))end
             local image=custom(path)
             assert(hub.running and art.Parent,"Menü kapandı.")
-            art.Image=image;hub.theme.artReady=true;hub.theme.status="Bülbül"
+            art.Image=image;hub.theme.artReady=true;hub.theme.status="Bülbül";hub.theme.asset=image
+            if hub.care and hub.care.setPlatformArt then hub.care.setPlatformArt(image)end
         end)
         if not ok then hub.theme.status=tostring(err);warn("[bülbül tema] "..tostring(err))end
     end)
