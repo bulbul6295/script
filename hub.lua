@@ -30,7 +30,7 @@ if env.BulbulComebackLoad and env.BulbulComebackLoad.inProgress then
     warn("[bülbül comeback] Menü yüklemesi devam ediyor; tamamlanmasını bekle.")
     return env.BulbulComeback
 end
-local report={ready=false,stage="Başlatılıyor",build="ghost-return-16"}
+local report={ready=false,stage="Başlatılıyor",build="void-farm-17"}
 report.inProgress=true
 env.BulbulComebackLoad=report
 local previousCare=env.AdoptMeCompanion
@@ -709,6 +709,183 @@ return function(randomIndex)
 end
 
 end)()
+local newVoidFarm=(function()
+-- Physical scene and server care context are deliberately separate.
+-- Native transitions always win; this controller never enters an interior.
+return function(ctx)
+    local farm={active=false,context=nil,origin=nil,scene=nil,returnPending=false}
+    function farm.finishReturn()
+        if not farm.returnPending then return true end
+        if ctx.Forced() or ctx.Scene()~=farm.scene then farm.returnPending=false;return true end
+        if not ctx.Ready() or ctx.Drained and not ctx.Drained()then return false end
+        if ctx.OnPlatform()and farm.origin then ctx.Return(farm.origin)end
+        farm.returnPending=false
+        return true
+    end
+    function farm.start()
+        if farm.active then return end
+        assert(ctx.Ready() and not ctx.Forced(), "Platform için konumun yüklenmesi bekleniyor.")
+        local scene=ctx.Scene()
+        if not (farm.returnPending and farm.scene==scene and ctx.OnPlatform())then farm.origin=ctx.Pivot()end
+        farm.scene=scene
+        farm.returnPending=false
+        ctx.Create()
+        farm.active=true
+        ctx.Place()
+    end
+    function farm.destination()
+        return farm.active and farm.context or ctx.Scene().destination_id
+    end
+    function farm.setContext(destination)
+        assert(farm.active and ctx.Ready() and not ctx.Forced(), "Platform bakımı duraklatıldı.")
+        assert(ctx.Scene()==farm.scene,"Fiziksel konum değişti; bakım yeniden hazırlanacak.")
+        if farm.context==destination then return end
+        ctx.Send(destination,destination=="housing" and ctx.Player or nil,nil)
+        farm.context=destination
+    end
+    function farm.suspend(returnToOrigin)
+        local current=ctx.Scene()
+        if farm.context and not ctx.Forced() and current==farm.scene then
+            ctx.Send(current.destination_id,current.house_owner,current.sub_destination_id)
+        end
+        farm.context=nil
+        farm.returnPending=returnToOrigin==true and farm.origin~=nil
+        farm.active=false
+        farm.finishReturn()
+    end
+    function farm.maintain()
+        if not farm.active then return false end
+        if ctx.Forced() or not ctx.Ready() or ctx.Scene()~=farm.scene then farm.suspend(false);return false end
+        ctx.Create()
+        if ctx.NeedsRecovery() then ctx.Place() end
+        return true
+    end
+    return farm
+end
+
+end)()
+local voidCarePlan=(function()
+-- Only native, location-independent care paths are scheduled from the platform.
+return function(row,ctx)
+    local kind=row.kind
+    local actor="actor:"..(row.target=="baby" and "baby" or tostring(row.unique))
+    local destination=ctx.anchor and ctx.anchor.plan.location or ctx.current
+    local plan={location=destination,atStation=true,stayPut=true,resources={},stallTimeout=60}
+    if ctx.areaKinds[kind] then
+        ctx.waiting[kind]="Bu görev sunucuda gerçek alan/mesafe kontrolü istiyor; platformdan tamamlanamıyor."
+        return nil
+    end
+    if kind=="at_work" then ctx.waiting[kind]="Aktif iş bitince bakım devam eder.";return nil end
+    if kind=="mystery" then plan.location=nil;plan.resources={actor};return plan end
+    if not ctx.venues[kind] then table.insert(plan.resources,actor) end
+    if (row.raw.rate or 0)>0 then
+        plan.mode,plan.ready="observe",true
+        if row.target=="baby" and (kind=="sleepy" or kind=="dirty" or kind=="toilet")then table.insert(plan.resources,"walking")end
+        if (kind=="walk" or kind=="ride")and ctx.anchor and
+            (ctx.anchor.row.kind=="walk" or ctx.anchor.row.kind=="ride")and ctx.anchor.row.unique==row.unique then plan.resources={}end
+        return plan
+    end
+    if ctx.venues[kind] then plan.location=ctx.venues[kind]
+    elseif ctx.foodKinds[kind] and (row.target=="baby" or kind=="sick" or ctx.food)then
+        plan.mode="food";plan.location=ctx.food and destination or ctx.foodVenues[kind]
+        table.insert(plan.resources,"tools")
+    elseif kind=="hungry" or kind=="thirsty" or kind=="sleepy" or kind=="dirty" or kind=="toilet" then
+        local entry=ctx.furniture
+        if entry then
+            plan.mode,plan.location,plan.furniture="furniture","housing",entry
+            plan.blockResource="block:"..tostring(entry.unique)..":"..entry.block.Name
+            table.insert(plan.resources,plan.blockResource)
+            if row.target=="baby"then table.insert(plan.resources,"walking")end
+        elseif ctx.foodKinds[kind]then
+            plan.mode,plan.location="food",ctx.foodVenues[kind];table.insert(plan.resources,"tools")
+        else ctx.waiting[kind]="Kendi evinde uygun ve boş mobilya gerekiyor; otomatik yeniden kontrol ediliyor.";return nil end
+    elseif kind=="walk" or kind=="ride"then
+        plan.location="MainMap";table.insert(plan.resources,"walking")
+        if kind=="ride"then table.insert(plan.resources,"tools")end
+    elseif kind=="play"then table.insert(plan.resources,"tools")
+    elseif kind=="pet_me"then table.insert(plan.resources,"focus")
+    else ctx.waiting[kind]="Platformdan çalışan doğrulanmış görev yolu bulunamadı.";return nil end
+    if ctx.anchor and plan.location==ctx.anchor.plan.location then plan.anchor=ctx.anchor end
+    return plan
+end
+
+end)()
+local newHouseReader=(function()
+-- Inspect a remote house while retaining the native transport lease through cleanup.
+return function(ctx)
+    local reader={blocked=false}
+    local function isTargetHouse(house,target)
+        return type(house)=="table" and house.player==target and house.house_id~=nil and
+            type(house.furniture)=="table"
+    end
+    local function append(errors,ok,err)
+        if not ok then errors[#errors+1]=tostring(err)end
+    end
+    function reader.discover(target,valid)
+        assert(not reader.blocked,"Önceki ev aboneliğinin temizlendiği doğrulanamadı.")
+        return ctx.Inspect(function()
+            -- Recheck after acquiring the shared lease: an earlier queued request may fail cleanup.
+            assert(not reader.blocked,"Önceki ev aboneliğinin temizlendiği doğrulanamadı.")
+            ctx.Check(valid)
+            local current=ctx.Current()
+            assert(type(current)=="table" and current.destination~=nil,"Mevcut konum okunamadı.")
+            local origin={destination=current.destination,owner=current.owner,houseId=current.houseId}
+            local house=ctx.Read()
+            if isTargetHouse(house,target)then return {house=house,loaded=true}end
+
+            local attempted,release=false,nil
+            local fetched,result=pcall(function()
+                release=ctx.Pin(origin)
+                assert(type(release)=="function","Önceki ev verisi korunamadı.")
+                ctx.Check(valid)
+                attempted=true -- A partially applied Subscribe that throws still requires cleanup.
+                ctx.Subscribe(target)
+                local deadline=ctx.Now()+10
+                while true do
+                    ctx.Check(valid)
+                    local data=ctx.Read()
+                    if isTargetHouse(data,target)then return data end
+                    assert(ctx.Now()<deadline,"Hedef evin mobilya verisi yüklenemedi.")
+                    ctx.Wait(0.1)
+                end
+            end)
+
+            local cleanupErrors={}
+            if attempted then
+                -- These calls deliberately ignore cancellation and forced-state changes. A pending
+                -- native invocation keeps the shared Inspect lease until it actually returns.
+                local ok,err=pcall(ctx.Unsubscribe,target)
+                append(cleanupErrors,ok,err)
+                if origin.destination=="housing" then
+                    ok,err=pcall(ctx.Subscribe,origin.owner)
+                    append(cleanupErrors,ok,err)
+                end
+                ok,err=pcall(function()
+                    local deadline=ctx.Now()+20
+                    while not ctx.Restored(origin)do
+                        assert(ctx.Now()<deadline,"Önceki ev aboneliği geri yüklenemedi.")
+                        ctx.Wait(0.1)
+                    end
+                end)
+                append(cleanupErrors,ok,err)
+            end
+            if release then
+                local ok,err=pcall(release)
+                append(cleanupErrors,ok,err)
+            end
+            if #cleanupErrors>0 then
+                reader.blocked=true
+                reader.error=table.concat(cleanupErrors," · ")
+                error("Ev aboneliği temizlenemedi · "..reader.error,0)
+            end
+            if not fetched then error(result,0)end
+            return {house=result,loaded=true}
+        end,valid)
+    end
+    return reader
+end
+
+end)()
 local transportFactory=(function()
 return function()
     local env=getgenv and getgenv() or _G
@@ -982,7 +1159,7 @@ local labels = {
     leaf_pile = "Yaprak yığını", diving_board = "Dalış tahtası", at_work = "İş başında",
 }
 local alive, busy, autoVenues, autoSwap = true, false, false, false
-local preferEggs,petHandover,actionPending=false,nil,0
+local preferEggs,petHandover,actionPending=true,nil,0
 local petChoice=newPetChoice(math.random)
 local lastBabySeatCharacter,lastBabySeatAt=nil,0
 local pauseReason,actionRetryAt,actionFailures=nil,0,0
@@ -994,6 +1171,10 @@ local movementOwner, navigationOwner, occupiedBlocks = nil, nil, {}
 local stationMode, careStation, stationLocation, stationInterior = true, nil, nil, nil
 local stationWaiting = {}
 local stationInitialized, stationRelative, createCareStation = false, nil, nil
+local voidMode=true
+local platformCF=CFrame.new(0,50000,0)
+local voidFarm,remoteHouse,nextHouseRead=nil,nil,0
+local remoteModels={}
 local careRoutes = {}
 local furnitureComponents = setmetatable({}, {__mode = "kv"})
 local badFurniture, lastComponentScan = setmetatable({}, {__mode = "k"}), -math.huge
@@ -1135,6 +1316,7 @@ local function runAction(fn)
     return true
 end
 local function locationId()
+    if voidFarm and voidFarm.active then return voidFarm.destination() end
     local loc = Interiors.get_current_location()
     return loc and loc.destination_id or "Yükleniyor"
 end
@@ -1171,7 +1353,9 @@ local function babySeatExit(owned, stage)
         local root=valid and character:FindFirstChild("HumanoidRootPart")
         local state=valid and StateManager.get(character)
         return {valid=valid,
-            transition=MinigameForcedState.is_enabled() or owned.seatDestination and locationId()~=owned.seatDestination,
+            transition=MinigameForcedState.is_enabled() or
+                (owned.voidScene and Interiors.get_current_location()~=owned.voidScene or
+                not owned.voidScene and owned.seatDestination and locationId()~=owned.seatDestination),
             sitting=state and state.is_sitting==true,
             connection=valid and character:FindFirstChild("StateConnection")~=nil,
             sit=humanoid and (humanoid.Sit or humanoid.SeatPart~=nil),
@@ -1334,6 +1518,11 @@ local function waitTask(row, token, seconds)
 end
 local function careNavigate(destination, row, token, settings)
     checkCare(row, token)
+    if voidMode then
+        voidFarm.setContext(destination)
+        checkCare(row,token)
+        return
+    end
     while navigationOwner and navigationOwner ~= row do
         checkCare(row, token); task.wait(0.1)
     end
@@ -1363,6 +1552,19 @@ local function careNavigate(destination, row, token, settings)
     end
 end
 createCareStation = function(restore)
+    if voidMode then
+        if careStation and careStation.Parent then return end
+        careStation=Instance.new("Part")
+        careStation.Name="BulbulVoidFarm"
+        careStation.Anchored=true
+        careStation.Size=Vector3.new(256,1,256)
+        careStation.CFrame=platformCF
+        careStation.Transparency=1
+        careStation.CanCollide,careStation.CanQuery,careStation.CanTouch=true,true,false
+        careStation.Parent=workspace
+        stationInitialized=true
+        return
+    end
     local character = assert(player.Character, "Karakter hazir degil.")
     local root = assert(character:FindFirstChild("HumanoidRootPart"), "Karakter hazir degil.")
     local loc = assert(Interiors.get_current_location(), "Konum hazir degil.")
@@ -1386,7 +1588,91 @@ createCareStation = function(restore)
     title.TextColor3, title.TextStrokeTransparency, title.TextSize = Color3.new(1, 1, 1), 0.3, 13
     title.Font, title.Parent = Enum.Font.GothamBold, titleGui
 end
+voidFarm=newVoidFarm({Player=player,Ready=transport.isReady,Forced=MinigameForcedState.is_enabled,
+    Drained=function()return not busy and actionPending==0 and careScheduler and careScheduler.Count()==0 end,
+    Scene=Interiors.get_current_location,Create=function()createCareStation()end,
+    Pivot=function()return player.Character and player.Character:GetPivot()end,
+    Send=function(destination,owner,sub)Router.get("LocationAPI/SetLocation"):FireServer(destination,owner,sub)end,
+    OnPlatform=function()
+        local root=player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+        return root and math.abs(root.Position.Y-platformCF.Position.Y)<200 and
+            math.abs(root.Position.X-platformCF.Position.X)<150 and math.abs(root.Position.Z-platformCF.Position.Z)<150
+    end,
+    NeedsRecovery=function()
+        local root=player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+        return root and (root.Position.Y<platformCF.Position.Y-2 or root.Position.Y>platformCF.Position.Y+35 or
+            math.abs(root.Position.X-platformCF.Position.X)>110 or math.abs(root.Position.Z-platformCF.Position.Z)>110)
+    end,
+    Return=function(cf)if player.Character then player.Character:PivotTo(cf)end end,
+    Place=function()
+        local character=assert(player.Character,"Karakter yükleniyor.")
+        character:PivotTo(platformCF*CFrame.new(0,4,0))
+        local root=character:FindFirstChild("HumanoidRootPart")
+        if root then root.AssemblyLinearVelocity=Vector3.zero;root.AssemblyAngularVelocity=Vector3.zero end
+        for _,wrapper in pairs(Equipped.get_my_equipped_char_wrappers())do
+            local entity=load("PetEntityManager").get_pet_entity(wrapper.char)
+            if entity then load("PetEntityManager").mark_for_immediate_teleport(entity)end
+        end
+    end})
+local houseReader=newHouseReader({Now=os.clock,Wait=task.wait,
+    Check=function(valid)
+        assert(alive,"Ev bilgisi: bakım kaldırıldı.")
+        assert(valid(),"Ev bilgisi: bakım nesli değişti veya farm kapatıldı.")
+        assert(not pauseReason,"Ev bilgisi: "..tostring(pauseReason))
+        assert(not MinigameForcedState.is_enabled(),"Ev bilgisi: mini oyun başladı.")
+    end,
+    Inspect=function(callback,valid)return transport.inspect(callback,valid)end,
+    Current=function()local l=Interiors.get_current_location();local h=CD.get("house_interior")
+        return {destination=l and l.destination_id,owner=l and l.house_owner,houseId=h and h.house_id}end,
+    Read=function()return CD.get("house_interior")end,
+    Subscribe=function(owner)Router.get("HousingAPI/SubscribeToHouse"):FireServer(owner)end,
+    Unsubscribe=function(owner)Router.get("HousingAPI/UnsubscribeFromHouse"):InvokeServer(owner)end,
+    Pin=function(origin)assert(origin.destination~="housing","Başka evdeyken güvenli mobilya sorgusu bekliyor.");return function()end end,
+    Restored=function(origin)local l=Interiors.get_current_location();local h=CD.get("house_interior")
+        return l and l.destination_id==origin.destination and l.house_owner==origin.owner and (not h or not h.player)end})
+local function refreshRemoteHouse(valid)
+    local result=houseReader.discover(player,valid)
+    remoteHouse=result.house
+    for _,model in pairs(remoteModels)do model:Destroy()end
+    remoteModels={}
+    -- Only clone native care models; never release DownloadClient's shared cache.
+    local wanted={Sleep=true,Clean=true,Eat=true}
+    local DB=load("FurnitureDB")
+    for unique,item in pairs(remoteHouse.furniture)do
+        assert(valid(),"Mobilya okuma iptal edildi.")
+        local def=DB[item.id]
+        if def and wanted[def.type] and def.model_name then
+            local ok,model=pcall(function()return load("DownloadClient").download("Furniture",def.model_name):Clone()end)
+            if ok and model then
+                model:PivotTo(platformCF)
+                remoteModels[unique]=model
+            end
+        end
+    end
+    nextHouseRead=os.clock()+120
+end
+local function findRemoteFurniture(kind,target,scheduler,includeBusy)
+    for unique,model in pairs(remoteModels)do
+        local item=remoteHouse and remoteHouse.furniture[unique]
+        local blocks=model:FindFirstChild("UseBlocks")
+        for _,block in ipairs(blocks and blocks:GetChildren()or {})do
+            local config=block:FindFirstChild("Configuration")
+            local id=config and config:FindFirstChild("use_id")
+            local behavior=id and FurnitureUseDB[id.Value]
+            local boost=behavior and behavior.ailment_to_boost
+            local resource="block:"..tostring(unique)..":"..block.Name
+            local permitted=behavior and (not behavior.team_whitelist or table.find(behavior.team_whitelist,target=="baby"and"Babies"or"Pets"))
+            if item and block:IsA("BasePart")and behavior and behavior.is_basic_use and boost and boost[1]==kind and permitted and
+                not (item.occupied and item.occupied[block.Name])and (badFurniture[block]or 0)<=os.clock()and
+                (includeBusy or not occupiedBlocks[block]and (not scheduler or not scheduler.IsReserved(resource)))then
+                return {remote=true,model=model,block=block,config=config,behavior=behavior,unique=unique,
+                    duration=boost[2]or 15,furnitureData=item}
+            end
+        end
+    end
+end
 local function findFurniture(kind, target, scheduler, includeBusy)
+    if voidMode then return findRemoteFurniture(kind,target,scheduler,includeBusy) end
     local best, distance = nil, math.huge
     local root = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
     for _, model in pairs(FurnitureTracker.get_furniture_models_list()) do
@@ -1449,6 +1735,7 @@ local function moveNear(position, row, token)
         return
     end
     local atStation = row.returningStation or row.careJob and row.careJob.plan.atStation
+    if voidMode and voidFarm.active then position=platformCF.Position+Vector3.new(0,4,0)end
     if stationMode and atStation and careStation and careStation.Parent then
         position = careStation.Position + Vector3.new(0, 3.5, 0)
     end
@@ -1471,6 +1758,8 @@ end
 local function furnitureCare(row, token, owned, plan)
     careNavigate(plan.location, row, token)
     local function available(entry)
+        if entry and entry.remote then return remoteModels[entry.unique]==entry.model and not occupiedBlocks[entry.block] and
+            (badFurniture[entry.block]or 0)<=os.clock() end
         local loc=Interiors.get_current_location()
         if not entry or not entry.model:IsDescendantOf(workspace) or not entry.block:IsDescendantOf(entry.model) or
             loc and loc.interior and not entry.model:IsDescendantOf(loc.interior) or occupiedBlocks[entry.block] then return false end
@@ -1481,6 +1770,7 @@ local function furnitureCare(row, token, owned, plan)
     end
     local entry=available(plan.furniture) and plan.furniture or findFurniture(row.kind,row.target,careScheduler)
     if not entry or not entry.unique then
+        if voidMode then error("Platformdan kullanılabilecek boş ev mobilyası bulunamadı: "..row.kind)end
         local fallback = nextFurnitureLocation(row,plan.location)
         if fallback and fallback ~= plan.location then
             error({retryLocation = fallback, message = "Mobilya eksik; uygun konuma gidilecek: " .. fallback})
@@ -1495,13 +1785,15 @@ local function furnitureCare(row, token, owned, plan)
     local wrapper = assert(wrapperFor(row), "Bakim karakteri bulunamadi.")
     if not plan.atStation then moveNear(entry.block.Position + Vector3.new(0, 3, 3), row, token) end
     plan.ready = true
-    local loc = Interiors.get_current_location()
+    local loc = entry.remote and {house_owner=player} or Interiors.get_current_location()
     local payload = entry.behavior.client_get_data_for_server_use and
         entry.behavior.client_get_data_for_server_use(entry.furnitureData or entry.config, entry.unique, entry.model,
             loc.house_owner, entry.block, entry.component, wrapper, wrapper.char)
     if entry.behavior.client_get_data_for_server_use then assert(payload, "Mobilya kullanim verisi alinamadi.") end
+    if entry.remote then payload=payload or {};payload.cframe=platformCF*CFrame.new(row.target=="baby"and 0 or 6,4,0)end
     if row.target == "baby" then
         owned.baby,owned.babyCharacter,owned.seatDestination=true,wrapper.char,plan.location
+        owned.voidScene=entry.remote and voidFarm.scene or nil
         lastBabySeatCharacter,lastBabySeatAt=wrapper.char,os.clock()
     else owned.pet = row.unique end
     local finished, requestError = false, nil
@@ -1584,7 +1876,7 @@ local function obtainFood(row, token)
     local kind = foodKinds[row.kind]
     local cost = InventoryDB.food[kind].cost or 0
     assert(not foodLedger.pending[kind],"Önceki yiyecek/su satın alımının envanter bildirimi bekleniyor; tekrar satın alınmayacak.")
-    assert(cost<=0 or waterSpent + reservedFoodBudget() + cost <= waterBudget, "Su bütçesi doldu ("..waterBudget.." Bucks); farm menüsünden limiti artırabilirsin.")
+    assert(cost<=0 or waterSpent + reservedFoodBudget() + cost <= waterBudget, "Su bütçesi doldu ("..waterBudget.." Bucks); Araçlar sekmesinden limiti artırabilirsin.")
     assert((data("money") or 0) >= cost, "Yiyecek/su icin yeterli Bucks yok.")
     if row.careJob and row.careJob.plan.location == foodVenues[row.kind] then careNavigate(foodVenues[row.kind], row, token) end
     observeFoodPurchases()
@@ -1936,7 +2228,7 @@ local function movementCare(row, token, owned)
             if enabled(row,token) and player.Character==character and root.Parent and humanoid.Parent and
                 locationId()=="MainMap" and transport.isReady()then humanoid:Move(direction,false)end
         end)
-        local seatOwned={babyCharacter=character,seatDestination="MainMap"}
+        local seatOwned={babyCharacter=character,seatDestination="MainMap",voidScene=voidMode and voidFarm.scene or nil}
         plan.ready=true
         if row.careJob then row.careJob.stage="Kesintisiz yürüyüş · güvenli rota"end
         walkingDriver({Now=os.clock,Wait=task.wait,Check=check,
@@ -2067,6 +2359,7 @@ local function performCare(row, token, owned, plan)
         plan.ready = true
         if row.target=="baby" and (row.kind=="sleepy" or row.kind=="dirty" or row.kind=="toilet") then
             owned.baby,owned.babyCharacter,owned.seatDestination=true,player.Character,plan.location
+            owned.voidScene=voidMode and voidFarm.scene or nil
             lastBabySeatCharacter,lastBabySeatAt=player.Character,os.clock()
         end
         plan.job.stage = "Sunucudaki mevcut ilerleme izleniyor"
@@ -2113,6 +2406,12 @@ local function performCare(row, token, owned, plan)
     else error("Bu event gorevi henuz desteklenmiyor: " .. row.kind) end
 end
 local function planCare(row, scheduler)
+    if voidMode then
+        return voidCarePlan(row,{current=locationId(),anchor=scheduler.Anchor and scheduler.Anchor(),waiting=stationWaiting,
+            venues=venues,foodKinds=foodKinds,foodVenues=foodVenues,food=findFood(row.kind,row.target),
+            furniture=findFurniture(row.kind,row.target,scheduler),
+            areaKinds={bored=true,camping=true,beach_party=true,party_zone=true,rain_puddle=true,snowman=true,leaf_pile=true,diving_board=true}})
+    end
     local actor = "actor:" .. (row.target == "pet" and tostring(row.unique) or "baby")
     local current = locationId()
     local anchor = scheduler.Anchor and scheduler.Anchor()
@@ -2344,6 +2643,9 @@ local function tickCare()
         api.equipSelected(); return
     end
     if stationMode and not stationInitialized then
+        if voidMode then
+            voidFarm.start()
+        else
         local loc = Interiors.get_current_location()
         if not careStation or not careStation.Parent or not loc or loc.interior ~= stationInterior then
             if careScheduler.Count() > 0 then cancelCare(); return end
@@ -2354,6 +2656,22 @@ local function tickCare()
                 checkCare(row, token)
                 createCareStation()
                 row.returningStation=true;moveNear(careStation.Position, row, token)
+            end)
+            return
+        end
+        end
+    end
+    if voidMode then
+        if not voidFarm.active and careScheduler.Count()>0 then return end
+        if not voidFarm.active then voidFarm.start()end
+        if not voidFarm.maintain()then return end
+        stationLocation=locationId()
+        if careScheduler.Count()==0 and os.clock()>=nextHouseRead then
+            local token=careEpoch
+            runAction(function()
+                local ok,err=pcall(refreshRemoteHouse,function()return alive and careEpoch==token and not pauseReason and (autoPets or autoBaby)end)
+                if not ok then nextHouseRead=os.clock()+30;api.remoteHouseError=tostring(err):match("[^\n]+");notify("Uzaktan mobilya bilgisi: "..api.remoteHouseError)
+                else api.remoteHouseError=nil end
             end)
             return
         end
@@ -2405,16 +2723,27 @@ table.insert(connections, CD.DataChangedEvent:Connect(function(key)
         key == "equip_manager" or key == "location" then wakeCare() end
 end))
 table.insert(connections, player.CharacterRemoving:Connect(function() cancelCare() end))
+local function stopVoidFarm()
+    if not voidFarm then return end
+    voidFarm.suspend(true)
+    task.spawn(function()
+        local deadline=os.clock()+30
+        while alive and not autoPets and not autoBaby and not pauseReason and os.clock()<deadline and
+            not voidFarm.finishReturn()do task.wait(0.2)end
+    end)
+end
 
 function api.setAutoPets(value)
     cancelCare(); stopGuide()
     autoPets, autoVenues, venueState = value == true, false, nil
+    if not autoPets and not autoBaby then stopVoidFarm()end
     notify(autoPets and "Pet bakımı event'lerle otomatik." or "Pet bakımı kapalı.")
     wakeCare()
 end
 function api.setAutoBaby(value)
     cancelCare(); stopGuide()
     autoBaby, autoVenues, venueState = value == true, false, nil
+    if not autoPets and not autoBaby then stopVoidFarm()end
     notify(autoBaby and "Bebek rolü ve görev otomasyonu açık." or "Bebek bakımı kapalı.")
     wakeCare()
 end
@@ -2422,6 +2751,7 @@ function api.stopAll()
     autoPets, autoBaby, autoVenues, autoSwap = false, false, false, false
     venueState = nil
     cancelCare(); stopGuide()
+    stopVoidFarm()
     notify("Bütün otomasyonlar durduruldu.")
 end
 function api.setPaused(reason)
@@ -2429,10 +2759,12 @@ function api.setPaused(reason)
     if pauseReason==nextReason then return end
     pauseReason=nextReason
     cancelCare();stopGuide();venueState=nil
+    if pauseReason and voidFarm then voidFarm.suspend(false)end
     if not pauseReason then actionRetryAt=0;wakeCare() end
     notify(pauseReason or "Tur bitti · bakım kaldığı yerden devam ediyor.")
 end
 function api.setStationMode(value)
+    if voidMode then stationMode=true;return end
     cancelCare()
     stationMode = value == true
     stationWaiting = {}
@@ -2446,6 +2778,7 @@ local function waitCareDrain()
     return alive
 end
 function api.setStationHere()
+    if voidMode then notify("Bakım platformu otomatik oluşturulur.");return false end
     cancelCare()
     return runAction(function()
         if not waitCareDrain() then return end
@@ -2563,7 +2896,9 @@ function api.snapshot()
         preferEggs=preferEggs,eggCount=inventoryEggCount,petChoiceMode=petChoice.mode,petHandover=petHandover~=nil,
         autoPets = autoPets, autoBaby = autoBaby, babyTasks = babyRows, team = data("team"),
         careState = careScheduler.Snapshot()[1], careJobs = careScheduler.Snapshot(),
-        activeCareJobs = careScheduler.Count(), peakCareJobs = careScheduler.peak, schedulerVersion = 8,
+        activeCareJobs = careScheduler.Count(), peakCareJobs = careScheduler.peak, schedulerVersion = 9,
+        voidFarm=voidFarm and voidFarm.active or false,logicalLocation=voidFarm and voidFarm.context,
+        remoteHouseError=api.remoteHouseError,
         paused=pauseReason~=nil,pauseReason=pauseReason,recoveries=careScheduler.recoveries,
         stationMode = stationMode, stationReady = careStation ~= nil and careStation.Parent ~= nil,
         stationLocation = stationLocation, stationWaiting = stationWaiting,
@@ -2584,6 +2919,7 @@ end
 function api.taskName(kind) return labels[kind] or kind end
 function api.unload()
     if not alive then return end
+    if voidFarm then voidFarm.suspend(true)end
     env.AdoptMeCarePrevious = {autoPets = autoPets, autoBaby = autoBaby, autoSwap = autoSwap,
         selected = selected, waterSpent = waterSpent,waterBudget=waterBudget,preferEggs=preferEggs}
     alive, autoVenues, autoSwap = false, false, false
@@ -2594,6 +2930,7 @@ function api.unload()
     for _, row in ipairs(taskRows) do row.connection:Disconnect() end
     if gui then gui:Destroy() end
     if careStation then careStation:Destroy(); careStation = nil end
+    for _,model in pairs(remoteModels)do model:Destroy()end
     if env.AdoptMeCompanion == api then env.AdoptMeCompanion = nil end
 end
 
@@ -8550,16 +8887,11 @@ local ok,err=xpcall(function()
     hub.care,hub.ghost,hub.candy=care,ghost,candy
     assert(env.BulbulComebackLoad==report,"Bu yükleme daha yeni bir sürümle değiştirildi.")
     env.BulbulComeback=hub
-    if previous.selected then
-        for _,pet in ipairs(care.pets()) do if pet.unique==previous.selected then care.select(previous.selected);break end end
-    end
-    care.setPreferEggs(previous.preferEggs==true)
+    care.setPreferEggs(true)
     if previous.waterBudget then care.setWaterBudget(previous.waterBudget) end
     care.setStationMode(previous.stationMode~=false)
-    if previous.autoVenues then care.setAutoVenues(true) else
-        care.setAutoPets(previous.autoPets==true);care.setAutoBaby(previous.autoBaby==true)
-    end
-    care.setAutoSwap(previous.autoSwap==true)
+    care.setAutoPets(previous.autoPets==true);care.setAutoBaby(previous.autoBaby==true)
+    care.setAutoSwap(false)
     ghost.setEnabled(previousGhost);candy.setEnabled(previousCandy)
 
     report.stage="Tur koordinatörü yükleniyor"
@@ -8615,7 +8947,9 @@ local ok,err=xpcall(function()
         local ready=care.transport.isReady()
         local inLobby=loc and m and loc.destination_id==m.join_zone_destination_id
         local queued=m and m.is_queued==true
-        return {active=active,transition=Forced.is_enabled() or inGame or not ready,
+        local phase=hub and hub.autoJoin and hub.autoJoin.phase
+        local settling=phase=="preparing"or phase=="playing"or phase=="exiting"or phase=="waiting"
+        return {active=active,transition=Forced.is_enabled() or inGame or not ready and (inLobby or queued or active or settling) or false,
             farmReady=ready and loc~=nil and not inLobby and not inGame and not queued,
             timestamp=cycle and cycle.timestamp,queued=m and m.is_queued,inJoinZone=inJoinZone(),
             loading=m and m.minigame_state:get("players_loading"),canInvite=Forced.can_receive_invites()}
@@ -8707,7 +9041,7 @@ local ok,err=xpcall(function()
     ui.OnUnload:Connect(clean)
     applyBulbulTheme(ui,window,hub)
     local tabs={
-        care=window:CreateTab{Title="Pet / Bebek",Icon="heart"},
+        care=window:CreateTab{Title="Farm",Icon="heart"},
         travel=window:CreateTab{Title="Konumlar",Icon="map-pin"},
         halloween=window:CreateTab{Title="Cadılar Bayramı",Icon="ghost"},
         transfer=window:CreateTab{Title="Bucks aktarımı",Icon="wallet"},
@@ -8767,35 +9101,17 @@ local ok,err=xpcall(function()
         end
     end
     local function paragraph(tab,id,title) return tab:CreateParagraph(id,{Title=title,Content="Hazırlanıyor…"}) end
-    local petStatus=paragraph(tabs.care,"PetStatus","Seçili pet")
-    local petChoices,petByLabel,petLabels,petFingerprint={}, {}, {}, nil
-    local petSelect=tabs.care:CreateDropdown("PetSelect",{Title="Pet seç",Values={},Multi=false,
-        Callback=action(function(value) local unique=petByLabel[value];if unique and care.snapshot().selected~=unique then care.select(unique) end end)})
-    tabs.care:CreateButton{Title="Seçili peti tak",Callback=action(care.equipSelected)}
+    local petStatus=paragraph(tabs.care,"PetStatus","Otomatik pet")
     local function toggle(tab,id,title,description,current,set)
         local control=tab:CreateToggle(id,{Title=title,Description=description,Default=current(),
             Callback=action(function(value) if current()~=value then set(value) end end)})
         hub.controls[id]=control
         return control
     end
-    toggle(tabs.care,"AutoPets","Pet görevleri","Uyumlu görevleri paralel yapar.",function()return care.snapshot().autoPets end,care.setAutoPets)
-    toggle(tabs.care,"AutoBaby","Bebek görevleri","Bebek rolüne geçer ve ihtiyaçları yapar.",function()return care.snapshot().autoBaby end,care.setAutoBaby)
-    toggle(tabs.care,"AutoSwap","Yetişkin peti değiştir","Büyümemiş pete otomatik geçer.",function()return care.snapshot().autoSwap end,care.setAutoSwap)
-    toggle(tabs.care,"PreferEggs","Yumurta tercih et","Yumurtaları görevlerle açar; bitince rastgele petle devam eder. Pet değişimine önceliklidir.",function()return care.snapshot().preferEggs end,care.setPreferEggs)
-    toggle(tabs.care,"AutoAgePotion","Otomatik Age-Up iksiri","Envanterdeki Age-Up iksirlerini seçili pet yetişkin olana kadar kullanır; yumurtalarda bekler.",function()return inventoryAutomation.ageEnabled end,inventoryAutomation.setAge)
-    local ageStatus=paragraph(tabs.care,"AgePotionStatus","Age-Up durumu")
-    local waterBudgetInput=tabs.care:CreateInput("WaterBudget",{Title="Su alımı bütçesi (0–1000 Bucks)",Description="Oturum limiti. Bebek su isterken kullanır; limit dolunca susuzluk bekler.",Default=tostring(care.snapshot().waterBudget),Numeric=true,Finished=true,
-        Callback=action(function(value)if tonumber(value)~=care.snapshot().waterBudget then care.setWaterBudget(value)end end)})
-    hub.controls.WaterBudget=waterBudgetInput
-    toggle(tabs.care,"StationMode","BasePart bakım noktası","Konum gerektiren görevler için ilgili yere gider.",function()return care.snapshot().stationMode end,care.setStationMode)
-    tabs.care:CreateButton{Title="Bakım noktasını burada ayarla",Callback=action(care.setStationHere)}
+    toggle(tabs.care,"AutoBaby","Baby Farm","Görünmez platformda bebek bakımı.",function()return care.snapshot().autoBaby end,care.setAutoBaby)
+    toggle(tabs.care,"AutoPets","Pet Farm","Peti otomatik seçer; yumurtaları önce açar. Görünmez platformda bakım yapar.",function()return care.snapshot().autoPets end,care.setAutoPets)
     local jobs=paragraph(tabs.care,"CareJobs","Görevler / ilerleme")
     local notice=paragraph(tabs.care,"CareNotice","Bakım durumu")
-    local guideMap={}
-    local guide=tabs.care:CreateDropdown("TaskGuide",{Title="Görev rehberi",Values={},Multi=false})
-    tabs.care:CreateButton{Title="Seçilen görevin oyun rehberini aç",Callback=action(function()
-        local key=guideMap[guide.Value];assert(key,"Aktif pet görevi seç.");care.guide(key)
-    end)}
     toggle(tabs.ghost,"GhostEnabled","Ghost Gallery otomasyonu","Hedefin dibine ışınlanır; düşünce Space gönderir.",function()return ghost.enabled end,ghost.setEnabled)
     toggle(tabs.ghost,"GhostAutoJoin","Turlara otomatik katıl","Başlamadan katılır; diğer görevler tur sonunda devam eder.",function()return hub.autoJoin.enabled end,hub.autoJoin.setEnabled)
     local ghostStatus=paragraph(tabs.ghost,"GhostStatus","Tur durumu")
@@ -8808,7 +9124,6 @@ local ok,err=xpcall(function()
     local cryptStatus=paragraph(tabs.crypt,"CryptStatus","Mezar / kat durumu")
     local inventoryStatus=paragraph(tabs.crypt,"InventoryStatus","Anahtar / iksir otomasyonu")
     tabs.crypt:CreateParagraph("CryptInfo",{Title="Merdiven yolu",Content="Yeşil: merdivenli doğru mezar.\nMavi: açılmış merdiven.\nKat ilerledikçe işaret yenilenir. Crypt dışında işaretler kaldırılır."})
-    toggle(travelTabs.pages.care.tab,"AutoVenues","Yalnızca konum görevleri","Okul, salon, pizza ve kafe takibi.",function()return care.snapshot().autoVenues end,care.setAutoVenues)
     travelButtons(travelTabs.pages.care.tab,catalog.care)
     travelButtons(travelTabs.pages.shops.tab,catalog.shops)
     travelButtons(travelTabs.pages.map.tab,catalog.map)
@@ -8819,6 +9134,11 @@ local ok,err=xpcall(function()
     local eventLocationStatus=paragraph(tabs.halloween,"EventLocationStatus","Bulunduğun konum")
     eventLocationStatus.Instance.Frame.LayoutOrder=0
     local traceStatus=paragraph(tabs.tools,"TraceStatus","Kayıt araçları")
+    toggle(tabs.tools,"AutoAgePotion","Otomatik Age-Up iksiri","Otomatik seçilen peti yetişkin olana kadar büyütür; yumurtalarda bekler.",function()return inventoryAutomation.ageEnabled end,inventoryAutomation.setAge)
+    local ageStatus=paragraph(tabs.tools,"AgePotionStatus","Age-Up durumu")
+    local waterBudgetInput=tabs.tools:CreateInput("WaterBudget",{Title="Su alımı bütçesi (0–1000 Bucks)",Description="Oturum limiti; limit dolunca susuzluk bekler.",Default=tostring(care.snapshot().waterBudget),Numeric=true,Finished=true,
+        Callback=action(function(value)if tonumber(value)~=care.snapshot().waterBudget then care.setWaterBudget(value)end end)})
+    hub.controls.WaterBudget=waterBudgetInput
     toggle(tabs.tools,"AntiAfk","AFK koruması","Oyun boşta kalma sinyali gönderdiğinde kısa giriş sağlar.",function()return hub.afk.enabled end,hub.afk.setEnabled)
     local afkStatus=paragraph(tabs.tools,"AfkStatus","AFK / sistem durumu")
     local playerByLabel,playerLabels,playerFingerprint={}, {},nil
@@ -8913,7 +9233,6 @@ local ok,err=xpcall(function()
     tabs.tools:CreateParagraph("MenuInfo",{Title="bülbül comeback",Content="End: menüyü gizle / göster.\nTema: Bülbül · zeytin yeşili / kahverengi / krem\nUI: Fluent Renewed"})
     window:SelectTab(1)
     local function setText(widget,value) if widget.Value~=value then widget:SetValue(value) end end
-    local guideFingerprint
     local function update()
         uiContext()
         local snap=care.snapshot()
@@ -8931,22 +9250,8 @@ local ok,err=xpcall(function()
         if waterBudgetInput.Value~=tostring(snap.waterBudget) then waterBudgetInput:SetValue(tostring(snap.waterBudget)) end
         setText(petStatus,string.format("%s · yaş %s/6\n%d pet · Bucks %s%s",snap.petName or "Pet yok",snap.age or "?",snap.petCount,snap.money or "?",
             snap.preferEggs and string.format("\nYumurta: %d · %s",snap.eggCount,snap.petChoiceMode=="egg" and "Yumurta açılıyor" or "Rastgele pet / bekleniyor") or ""))
-        petChoices=care.pets();local signature={}
-        for _,pet in ipairs(petChoices) do table.insert(signature,pet.unique..":"..pet.name..":"..pet.age) end
-        signature=table.concat(signature,"|")
-        if signature~=petFingerprint then
-            petFingerprint=signature;petByLabel={};petLabels={}
-            local values={}
-            for index,pet in ipairs(petChoices) do
-                local label=string.format("%d · %s · %s/6",index,pet.name,pet.age)
-                table.insert(values,label);petByLabel[label]=pet.unique;petLabels[pet.unique]=label
-            end
-            petSelect:SetValues(values)
-        end
-        local selectedLabel=petLabels[snap.selected]
-        if selectedLabel and petSelect.Value~=selectedLabel then petSelect:SetValue(selectedLabel) end
-        local actual={AutoPets=snap.autoPets,AutoBaby=snap.autoBaby,AutoSwap=snap.autoSwap,PreferEggs=snap.preferEggs,AntiAfk=hub.afk.enabled,StationMode=snap.stationMode,
-            AutoVenues=snap.autoVenues,GhostEnabled=ghost.enabled,GhostAutoJoin=hub.autoJoin.enabled,CandyEnabled=candy.enabled,TransferEnabled=transfer.enabled,CryptESP=crypt.enabled,
+        local actual={AutoPets=snap.autoPets,AutoBaby=snap.autoBaby,AntiAfk=hub.afk.enabled,
+            GhostEnabled=ghost.enabled,GhostAutoJoin=hub.autoJoin.enabled,CandyEnabled=candy.enabled,TransferEnabled=transfer.enabled,CryptESP=crypt.enabled,
             CryptAuto=inventoryAutomation.cryptEnabled,AutoAgePotion=inventoryAutomation.ageEnabled,TransferRemoteOnly=transfer.remoteOnly}
         for id,value in pairs(actual) do local control=hub.controls[id];if control.Value~=value then control:SetValue(value) end end
         local lines={string.format("%d aktif / en fazla 6 paralel iş",snap.activeCareJobs)}
@@ -8956,17 +9261,10 @@ local ok,err=xpcall(function()
             for _,row in ipairs(list.rows) do
                 local job=active[(list.name=="Pet" and "pet" or "baby")..":"..row.key]
                 table.insert(lines,list.name.." · "..care.taskName(row.kind).." · %"..math.floor(row.progress*100).." · "..
-                    (job and (job.mode=="observe" and "İlerliyor" or job.stage) or "Sırada"))
+                    (job and (job.mode=="observe" and "İlerliyor" or job.stage) or snap.stationWaiting[row.kind] or "Sırada"))
             end
         end
         setText(jobs,table.concat(lines,"\n"));setText(notice,(snap.pauseReason or snap.lastError or snap.notice or "Hazır")..string.format("\nSu alımı: %d + %d ayrılan / %d Bucks",snap.waterSpent,snap.waterReserved or 0,snap.waterBudget))
-        local values,newMap,signature={},{},{}
-        for _,row in ipairs(snap.tasks) do
-            local label=care.taskName(row.kind).." · "..row.key
-            table.insert(values,label);newMap[label]=row.key;table.insert(signature,label)
-        end
-        signature=table.concat(signature,"|")
-        if signature~=guideFingerprint then guideFingerprint=signature;guideMap=newMap;guide:SetValues(values) end
         setText(ghostStatus,string.format("%s\n%s\nPuan: %s · Işınlanma: %s\nKalkış: %s%s",hub.autoJoin.status,ghost.status,ghost.score,ghost.teleports or 0,ghost.recoveryJumps or 0,ghost.error and "\n"..ghost.error or ""))
         setText(candyStatus,string.format("%s\nToplanan: %s · İstek: %s%s",candy.status,candy.confirmed,candy.sent,candy.error and "\n"..candy.error or ""))
         local cryptSnap=crypt.snapshot()
