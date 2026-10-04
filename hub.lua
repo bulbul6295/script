@@ -30,18 +30,21 @@ if env.BulbulComebackLoad and env.BulbulComebackLoad.inProgress then
     warn("[bülbül comeback] Menü yüklemesi devam ediyor; tamamlanmasını bekle.")
     return env.BulbulComeback
 end
-local report={ready=false,stage="Başlatılıyor",build="afk-eggs-8"}
+local report={ready=false,stage="Başlatılıyor",build="crypt-age-batch-10"}
 report.inProgress=true
 env.BulbulComebackLoad=report
 local previousCare=env.AdoptMeCompanion
 local captured,previous=pcall(function()return previousCare and previousCare.snapshot() or env.BulbulComebackLastPrefs or {}end)
 if not captured then previous=env.BulbulComebackLastPrefs or {} end
 local previousGhost,previousCandy=previous.ghostEnabled==true,previous.candyEnabled==true
+local previousCrypt=previous.cryptEnabled==true
+if env.BulbulCryptESP then previousCrypt=env.BulbulCryptESP.enabled==true end
 if env.AdoptMeGhostGallery then previousGhost=env.AdoptMeGhostGallery.enabled==true end
 if env.AdoptMeCandyRain then previousCandy=env.AdoptMeCandyRain.enabled==true end
 env.BulbulComebackLastPrefs=table.clone(previous)
 env.BulbulComebackLastPrefs.ghostEnabled=previousGhost
 env.BulbulComebackLastPrefs.candyEnabled=previousCandy
+env.BulbulComebackLastPrefs.cryptEnabled=previousCrypt
 local previousAutoJoin=true
 if env.BulbulComeback and env.BulbulComeback.autoJoin then previousAutoJoin=env.BulbulComeback.autoJoin.enabled end
 local previousAfk=not env.BulbulComeback or not env.BulbulComeback.afk or env.BulbulComeback.afk.enabled
@@ -2855,6 +2858,7 @@ return function(ctx, previous)
     local state={enabled=false,busy=false,running=true,status="Kapalı",epoch=0,nextAt=0,
         targetId=previous.targetId,amount=previous.amount or 50,interval=previous.interval or 60,
         limit=previous.limit==nil and 500 or previous.limit,reserve=previous.reserve or 0,
+        batchCount=previous.batchCount or 3,remoteOnly=previous.remoteOnly~=false,
         reserved=previous.reserved or 0,confirmed=previous.confirmed or 0,attempts=previous.attempts or 0}
     local function number(value,min,max)
         local n=tonumber(value)
@@ -2865,6 +2869,7 @@ return function(ctx, previous)
         return {enabled=state.enabled,busy=state.busy,status=state.status,paused=state.pauseReason~=nil,
             pauseReason=state.pauseReason,targetId=state.targetId,amount=state.amount,interval=state.interval,
             limit=state.limit,reserve=state.reserve,reserved=state.reserved,confirmed=state.confirmed,
+            batchCount=state.batchCount,remoteOnly=state.remoteOnly,
             attempts=state.attempts,nextIn=math.max(0,math.ceil(state.nextAt-ctx.Now())),error=state.error,
             busyFor=state.busySince and math.max(0,ctx.Now()-state.busySince) or 0,stage=state.stage}
     end
@@ -2880,6 +2885,8 @@ return function(ctx, previous)
     function state.setInterval(value)editable();state.interval=number(value,60,3600);save()end
     function state.setLimit(value)editable();state.limit=number(value,0,1e9);save()end
     function state.setReserve(value)editable();state.reserve=number(value,0,1e9);save()end
+    function state.setBatchCount(value)editable();state.batchCount=number(value,1,20);save()end
+    function state.setRemoteOnly(value)editable();state.remoteOnly=value==true;save()end
     function state.reset()
         editable();state.reserved,state.confirmed,state.attempts=0,0,0;state.error=nil;state.status="Sayaç sıfırlandı";save()
     end
@@ -2931,21 +2938,34 @@ return function(ctx, previous)
         local function valid()return state.running and state.enabled and not state.pauseReason and token==state.epoch end
         ctx.Spawn(function()
             local sent,receipt=false,nil
+            local batchConfirmed=0
             local ok,err=pcall(function()
                 state.stage="Bakım temizleniyor"
                 ctx.Acquire(valid);assert(valid(),"Aktarım iptal edildi.")
                 state.stage="Kasa hazırlanıyor"
                 ctx.Prepare(target,valid);assert(valid(),"Aktarım iptal edildi.")
-                assert(ctx.Resolve(state.targetId)==target,"Hedef oyuncu değişti veya ayrıldı.")
-                local permitted,why=ctx.Allowed();assert(permitted,why)
-                assert(ctx.Balance()-state.reserve>=amount,"Ödeme öncesinde bakiye değişti.")
-                state.reserved+=amount;state.attempts+=1;sent=true;save()
-                state.status="Ödeme gönderiliyor · "..amount.." Bucks"
-                state.stage="Ödeme yanıtı bekleniyor"
-                receipt=ctx.Pay(target,amount,valid)
+                for index=1,state.batchCount do
+                    assert(valid(),"Aktarım iptal edildi.")
+                    assert(ctx.Resolve(state.targetId)==target,"Hedef oyuncu değişti veya ayrıldı.")
+                    local permitted,why=ctx.Allowed();assert(permitted,why)
+                    local funds=ctx.Balance()
+                    assert(type(funds)=="number" and funds==funds and funds>=0 and funds<math.huge,"Bakiye henüz hazır değil.")
+                    local left=state.limit==0 and state.amount or state.limit-state.reserved
+                    amount=math.floor(math.min(state.amount,left,funds-state.reserve))
+                    if amount<1 then break end
+                    sent=false;receipt=nil
+                    state.reserved+=amount;state.attempts+=1;sent=true;save()
+                    state.status="Toplu ödeme "..index.."/"..state.batchCount.." · "..amount.." Bucks"
+                    state.stage="Ödeme yanıtı bekleniyor"
+                    receipt=ctx.Pay(target,amount,valid)
+                    if receipt and receipt.confirmed then
+                        state.confirmed+=amount;batchConfirmed+=amount;state.error=nil;sent=false;save()
+                    elseif receipt and receipt.rejected then
+                        state.reserved-=amount;sent=false;save();break
+                    else break end
+                    if index<state.batchCount and ctx.Wait then ctx.Wait(0.25)end
+                end
             end)
-            if sent and receipt and receipt.confirmed then state.confirmed+=amount;state.error=nil end
-            if sent and receipt and receipt.rejected and not receipt.confirmed then state.reserved-=amount end
             state.stage="Konuma dönülüyor"
             local cleaned,cleanError=pcall(ctx.Release,valid)
             state.busy=false;state.busySince=nil;state.stage=nil
@@ -2958,7 +2978,7 @@ return function(ctx, previous)
                 state.enabled=false;state.status="İstek gönderildi, kesinti doğrulanamadı; aktarım durdu"
             elseif cleaned and valid() and receipt and receipt.rejected then
                 state.status="Kasa ödemeyi kabul etmedi; bekleniyor"
-            elseif cleaned and valid() then state.status="Son ödeme doğrulandı · "..amount.." Bucks"
+            elseif cleaned and valid() then state.status="Toplu ödeme doğrulandı · "..batchConfirmed.." Bucks"
             elseif cleaned and receipt and receipt.confirmed and not state.enabled then state.status="Son ödeme doğrulandı · aktarım kapalı" end
             if cleaned and state.limit>0 and state.reserved>=state.limit then state.enabled=false;state.status="Toplam limit tamamlandı" end
             state.nextAt=ctx.Now()+math.max(state.interval,receipt and receipt.rejected and 120 or not ok and 60 or 0)
@@ -2967,6 +2987,7 @@ return function(ctx, previous)
     end
     -- Invalid persisted values cannot silently expand a spending budget.
     state.amount=number(state.amount,1,50);state.interval=number(state.interval,60,3600)
+    state.batchCount=number(state.batchCount,1,20)
     state.limit=number(state.limit,0,1e9);state.reserve=number(state.reserve,0,1e9)
     state.reserved=number(state.reserved,0,1e12);state.confirmed=number(state.confirmed,0,state.reserved)
     state.attempts=number(state.attempts,0,1e12)
@@ -2985,6 +3006,10 @@ end
     local pauseText="Bucks aktarımı için bakım bekliyor"
     local beforeLocation,register,activeDebit=nil,nil,nil
     local ownsPause,transportStarted=false,false
+    local cache=env.BulbulRegisterCache
+    if not cache or cache.owner~=player.UserId or cache.server~=game.JobId then
+        cache={owner=player.UserId,server=game.JobId,registers={}};env.BulbulRegisterCache=cache
+    end
     local function balance()
         local value=tonumber(CD.get("money"))
         assert(value and value==value and value<math.huge and value>=0,"Bakiye henüz hazır değil.")
@@ -3026,7 +3051,11 @@ end
             end
         end
         table.sort(choices,function(a,b)return tostring(a.unique)<tostring(b.unique)end)
-        return choices[1]
+        local found=choices[1]
+        if found then
+            cache.registers[target.UserId]={unique=found.unique,blockName=found.block.Name,owner=target.UserId}
+        end
+        return found
     end
     local function rejection()
         local dialog=load("UIManager").apps.DialogApp
@@ -3042,7 +3071,8 @@ end
     end
     local previous=env.BulbulBucksPrefs
     if previous and previous.ownerId~=player.UserId then previous=nil end
-    local transfer=newLoop({Now=os.clock,Spawn=task.spawn,Resolve=resolve,Balance=balance,
+    local transfer
+    transfer=newLoop({Now=os.clock,Spawn=task.spawn,Resolve=resolve,Balance=balance,Wait=task.wait,
         Save=function(prefs)prefs.ownerId=player.UserId;env.BulbulBucksPrefs=prefs end,
         Allowed=function()
             if Forced.is_enabled()then return false,"Mini oyun sırasında ödeme bekliyor"end
@@ -3067,6 +3097,12 @@ end
         end,
         Prepare=function(target,valid)
             check(valid)
+            if transfer.remoteOnly then
+                findRegister(target)
+                register=cache.registers[target.UserId]
+                assert(register and register.owner==target.UserId,"Kasa kimliği bilinmiyor; hedefin evindeyken kasayı bir kez kaydet.")
+                return
+            end
             if not ownerIs(location(),target)then
                 transportStarted=true
                 Interiors.enter_smooth("housing","MainDoor",{house_owner=target})
@@ -3087,13 +3123,17 @@ end
         end,
         Pay=function(target,amount,valid)
             check(valid)
-            assert(ownerIs(location(),target) and register and register.model.Parent and
-                Tracker.get_furniture_by_unique(register.unique)==register.model,"Ödeme kasası veya ev sahibi değişti.")
+            if transfer.remoteOnly then
+                assert(register and register.owner==target.UserId and cache.registers[target.UserId]==register,"Kayıtlı kasa değişti.")
+            else
+                assert(ownerIs(location(),target) and register and register.model.Parent and
+                    Tracker.get_furniture_by_unique(register.unique)==register.model,"Ödeme kasası veya ev sahibi değişti.")
+            end
             assert(resolve(target.UserId)==target,"Hedef oyuncu ayrıldı.")
             assert(not rejection(),"Önce kasanın önceki ödeme uyarısını kapat.")
             activeDebit={last=balance(),matched=false,amount=amount}
             local paid,payError=pcall(function()
-                Router.get("HousingAPI/ActivateFurniture"):InvokeServer(target,register.unique,register.block.Name,amount,player.Character)
+                Router.get("HousingAPI/ActivateFurniture"):InvokeServer(target,register.unique,register.blockName or register.block.Name,amount,player.Character)
             end)
             local deadline=os.clock()+4
             while paid and not activeDebit.matched and not rejection() and os.clock()<deadline do task.wait(0.1)end
@@ -3153,7 +3193,483 @@ end
     -- Keep the outstanding request visible even after its menu is unloaded.
     -- Reload waits for this lease before constructing another payment worker.
     env.BulbulBucksActive=transfer
+    function transfer.captureRegister()
+        assert(not transfer.enabled and not transfer.busy,"Kasayı kaydetmeden önce aktarımı durdur.")
+        local loc=location();local owner=loc and loc.house_owner
+        assert(loc and loc.destination_id=="housing" and owner and resolve(owner.UserId),"Hedef oyuncunun evindeyken kaydet.")
+        local found=findRegister(owner);assert(found,"Bu evde ödeme kasası bulunamadı.")
+        return cache.registers[owner.UserId]
+    end
     return transfer
+end
+
+end)()
+local createCrypt=(function()
+local targets=(function()
+-- Uses replicated native contents; it never rolls/predicts unrevealed floors.
+local targets={}
+function targets.Describe(state,rules,layout)
+    local result={targets={},status="Crypt verisi bekleniyor",final=false}
+    if type(state)~="table" or type(state.floors)~="table" then return result end
+    local opened=layout.opened_set(state.opened)
+    for floor,rule in ipairs(rules)do
+        local contents=state.floors[floor]
+        if type(contents)~="table" or type(contents.coffins)~="table" then
+            result.status="Kat "..floor.." verisi bekleniyor";return result
+        end
+        if rule.is_final then
+            result.final=true;result.status="Son oda · merdivenli mezarlar tamamlandı";return result
+        end
+        local ok,index=pcall(layout.get_ladder_slot,contents)
+        local count=0
+        for _,kind in pairs(contents.coffins)do if kind=="ladder" then count+=1 end end
+        if not ok or type(index)~="number" or index%1~=0 or index<1 or index>rule.coffins or
+            contents.coffins[index]~="ladder" or count~=1 then
+            result.status="Kat "..floor.." merdiven bilgisi doğrulanamadı";return result
+        end
+        local id=layout.padlock_key(floor,index)
+        local isOpened=opened[id]==true
+        table.insert(result.targets,{floor=floor,index=index,id=id,opened=isOpened,
+            room=floor==1 and "StartRoom" or rule.template})
+        result.currentFloor,result.currentIndex=floor,index
+        if not isOpened then
+            result.status="Kat "..floor.." · doğru mezar #"..index;return result
+        end
+    end
+    return result
+end
+function targets.Match(candidates,position,distance)
+    local best,bestDistance=nil,distance or 0.75
+    for _,candidate in ipairs(candidates)do
+        local delta=(candidate.position-position).Magnitude
+        if delta<=bestDistance then best,bestDistance=candidate.model,delta end
+    end
+    return best
+end
+return targets
+
+end)()
+return function(host)
+    local env=type(getgenv)=="function" and getgenv() or _G
+    local old=env.BulbulCryptESP
+    local initial=old and old.enabled==true
+    if old and old.stop then old.stop()end
+    local state={enabled=initial==true,running=true,status="Kapalı",marks={},targets={},matched=0}
+    local Players,RS=game:GetService("Players"),game:GetService("ReplicatedStorage")
+    local player=assert(Players.LocalPlayer,"Oyuncu hazır değil.")
+    local load=require(RS.Fsys).load
+    local CD,Interiors=load("ClientData"),load("InteriorsM")
+    local package=RS.SharedModules.ContentPacks.Halloween2026.Game.TheCrypt
+    local constants,layout=require(package.CryptConstants),require(package.CryptLayout)
+    local playerGui=assert(player:FindFirstChildOfClass("PlayerGui"),"PlayerGui hazır değil.")
+    local folder=Instance.new("Folder")
+    folder.Name="BulbulCryptESPMarks";folder.Parent=playerGui
+    local panelGui,statusLabel,toggleButton
+    local function destroyMark(mark)
+        if mark.highlight then mark.highlight:Destroy()end
+        if mark.label then mark.label:Destroy()end
+    end
+    local function clear()
+        for id,mark in pairs(state.marks)do destroyMark(mark);state.marks[id]=nil end
+        state.targets={};state.matched=0;state.floor=nil;state.index=nil
+    end
+    function state.setEnabled(value)
+        if not state.running then return end
+        state.enabled=value==true
+        if not state.enabled then clear();state.status="Kapalı";state.error=nil end
+    end
+    function state.stop()
+        if not state.running then return end
+        state.running=false;state.enabled=false;clear();folder:Destroy()
+        if panelGui then panelGui:Destroy()end
+        if env.BulbulCryptESP==state then env.BulbulCryptESP=nil end
+    end
+    function state.snapshot()
+        return {enabled=state.enabled,status=state.status,matched=state.matched,targets=state.targets,
+            floor=state.floor,index=state.index,seed=state.seed,error=state.error}
+    end
+    local function makeMark(model,anchor)
+        local highlight=Instance.new("Highlight")
+        highlight.Name="CorrectCryptGrave";highlight.Adornee=model
+        highlight.DepthMode=Enum.HighlightDepthMode.AlwaysOnTop
+        highlight.FillTransparency=0.65;highlight.OutlineTransparency=0;highlight.Parent=folder
+        local label=Instance.new("BillboardGui")
+        label.Name="CorrectCryptGraveLabel";label.Adornee=anchor
+        label.AlwaysOnTop=true;label.MaxDistance=1500;label.Size=UDim2.fromOffset(240,58)
+        label.StudsOffsetWorldSpace=Vector3.new(0,4,0);label.Parent=folder
+        local text=Instance.new("TextLabel")
+        text.Size=UDim2.fromScale(1,1);text.BackgroundColor3=Color3.fromRGB(12,22,35)
+        text.BackgroundTransparency=0.2;text.Font=Enum.Font.GothamBold;text.TextSize=15
+        text.TextWrapped=true;text.Parent=label
+        local corner=Instance.new("UICorner");corner.CornerRadius=UDim.new(0,7);corner.Parent=text
+        return {model=model,anchor=anchor,highlight=highlight,label=label,text=text}
+    end
+    local function refresh()
+        if not state.enabled then return end
+        local loc=Interiors.get_current_location()
+        local interior=loc and loc.interior
+        if not loc or loc.destination_id~=constants.DESTINATION_ID or not interior or not interior.Parent then
+            clear();state.status="Crypt dışında · oda bekleniyor";state.floor=nil;state.index=nil;return
+        end
+        local data=CD.get(constants.STORE_KEY)
+        if type(data)~="table" then clear();state.status="Crypt verisi bekleniyor";return end
+        if state.seed~=data.seed or state.interior~=interior then clear()end
+        state.seed,state.interior=data.seed,interior
+        local description=targets.Describe(data,constants.FLOORS,layout)
+        state.status,state.targets=description.status,description.targets
+        state.floor,state.index=description.currentFloor,description.currentIndex
+        local generated=interior:FindFirstChild(constants.GENERATED_FOLDER_NAME)
+        local candidates={}
+        for _,model in ipairs(generated and generated:GetChildren() or {})do
+            local anchor=model.Name=="Coffin" and model:FindFirstChild("RewardSpawn")
+            if model:IsA("Model") and anchor and anchor:IsA("Attachment") then
+                table.insert(candidates,{model=model,position=anchor.WorldPosition})
+            end
+        end
+        local wanted={};state.matched=0
+        for _,target in ipairs(description.targets)do
+            local room=target.floor==1 and interior:FindFirstChild(target.room) or generated and generated:FindFirstChild(target.room)
+            local gameFolder=room and room:FindFirstChild("Game")
+            local spawns=gameFolder and gameFolder:FindFirstChild("CoffinSpawns")
+            local spawn=spawns and spawns:FindFirstChild(tostring(target.index))
+            local model=spawn and spawn:IsA("Attachment") and targets.Match(candidates,spawn.WorldPosition)
+            local anchor=model and model:FindFirstChild("InteractionPart")
+            if model and anchor and anchor:IsA("BasePart") then
+                local id=tostring(target.id)
+                wanted[id]=true;state.matched+=1
+                local mark=state.marks[id]
+                if mark and (mark.model~=model or mark.anchor~=anchor)then destroyMark(mark);state.marks[id]=nil;mark=nil end
+                if not mark then mark=makeMark(model,anchor);state.marks[id]=mark end
+                local color=target.opened and Color3.fromRGB(95,175,255) or Color3.fromRGB(90,255,120)
+                mark.highlight.FillColor=color;mark.highlight.OutlineColor=color;mark.text.TextColor3=color
+                mark.text.Text="Kat "..target.floor.." · Mezar #"..target.index.."\n"..
+                    (target.opened and "MERDİVEN AÇIK · AŞAĞI İN" or "DOĞRU MEZAR · MERDİVEN")
+            end
+        end
+        for id,mark in pairs(state.marks)do if not wanted[id]then destroyMark(mark);state.marks[id]=nil end end
+        if #description.targets>0 and state.matched<#description.targets then
+            state.status=state.status.." · mezar modeli yükleniyor"
+        end
+    end
+    state.refresh=refresh
+    env.BulbulCryptESP=state
+    if not host then
+        panelGui=Instance.new("ScreenGui")
+        panelGui.Name="BulbulCryptESPPanel";panelGui.ResetOnSpawn=false;panelGui.DisplayOrder=95;panelGui.Parent=playerGui
+        local panel=Instance.new("Frame")
+        panel.Size=UDim2.fromOffset(285,120);panel.Position=UDim2.new(0,12,0,90)
+        panel.BackgroundColor3=Color3.fromRGB(15,30,60);panel.Parent=panelGui
+        local corner=Instance.new("UICorner");corner.CornerRadius=UDim.new(0,8);corner.Parent=panel
+        toggleButton=Instance.new("TextButton")
+        toggleButton.Size=UDim2.new(1,-44,0,32);toggleButton.Position=UDim2.fromOffset(8,8)
+        toggleButton.TextSize=15;toggleButton.Parent=panel
+        toggleButton.Activated:Connect(function()state.setEnabled(not state.enabled)end)
+        local close=Instance.new("TextButton")
+        close.Size=UDim2.fromOffset(28,32);close.Position=UDim2.new(1,-34,0,8);close.Text="X";close.Parent=panel
+        close.Activated:Connect(state.stop)
+        statusLabel=Instance.new("TextLabel")
+        statusLabel.Size=UDim2.new(1,-16,0,66);statusLabel.Position=UDim2.fromOffset(8,46)
+        statusLabel.BackgroundTransparency=1;statusLabel.TextColor3=Color3.new(1,1,1)
+        statusLabel.TextSize=14;statusLabel.TextWrapped=true;statusLabel.Parent=panel
+        state.setEnabled(true)
+    end
+    task.spawn(function()
+        while state.running do
+            local ok,err=pcall(refresh)
+            if ok then state.error=nil else clear();state.error=tostring(err);state.status="Crypt verisi yeniden kontrol ediliyor"end
+            if statusLabel then statusLabel.Text=state.status..(state.error and "\n"..state.error:sub(1,140) or "")end
+            if toggleButton then toggleButton.Text="Doğru mezar ESP: "..(state.enabled and "AÇIK" or "KAPALI")end
+            task.wait(0.3)
+        end
+    end)
+    return state
+end
+
+end)()
+local createInventory=(function()
+return function(care,hub)
+    local newLoop=(function()
+-- A single lease owns key/potion calls until their replicated result is known.
+return function(ctx)
+    local s={running=true,busy=false,cryptEnabled=false,ageEnabled=false,epoch=0,nextAt=0,
+        status="Kapalı",attempts=0,opened=0,rewards=0,potions=0}
+    local function enabled(action)return action.kind=="crypt" and s.cryptEnabled or action.kind=="age" and s.ageEnabled end
+    function s.snapshot()
+        return {cryptEnabled=s.cryptEnabled,ageEnabled=s.ageEnabled,busy=s.busy,status=s.status,error=s.error,
+            attempts=s.attempts,opened=s.opened,rewards=s.rewards,potions=s.potions,stage=s.stage}
+    end
+    local function set(field,value)
+        assert(s.running,"Modül kaldırıldı.")
+        value=value==true
+        if s[field]==value then return end
+        s[field]=value;s.epoch+=1;s.nextAt=0;s.error=nil
+        if not s.cryptEnabled and not s.ageEnabled then s.status=s.busy and "Mevcut sonuç bekleniyor" or "Kapalı" end
+    end
+    function s.setCrypt(value)set("cryptEnabled",value)end
+    function s.setAge(value)set("ageEnabled",value)end
+    function s.stopAll()s.cryptEnabled=false;s.ageEnabled=false;s.epoch+=1;s.status=s.busy and "Mevcut sonuç bekleniyor" or "Kapalı" end
+    function s.stop()s.stopAll();s.running=false end
+    function s.step()
+        if s.busy then
+            if ctx.Now()-s.started>=60 and (s.cryptEnabled or s.ageEnabled) then
+                s.stopAll();s.error="Sunucu yanıtı uzadı; mevcut istek bekleniyor";s.status=s.error
+            end
+            return
+        end
+        if not s.running or not (s.cryptEnabled or s.ageEnabled) or ctx.Now()<s.nextAt then return end
+        local permitted,why=ctx.Allowed()
+        if not permitted then s.status=why;return end
+        local planned,action,status=pcall(ctx.Plan,s)
+        if not planned then s.error=tostring(action);s.status="Veri yeniden kontrol ediliyor";s.nextAt=ctx.Now()+3;return end
+        s.status=status or s.status
+        if not action then return end
+        s.busy=true;s.started=ctx.Now();s.stage=action.mode
+        local epoch=s.epoch
+        local function valid()
+            local allowed=ctx.Allowed()
+            return s.running and enabled(action) and epoch==s.epoch and allowed
+        end
+        ctx.Spawn(function()
+            local sent=false
+            local ok,receipt=pcall(function()
+                ctx.Acquire(action,valid);assert(valid(),"İşlem duraklatıldı.")
+                return ctx.Run(action,valid,function()sent=true;s.attempts+=1 end)
+            end)
+            if ok and receipt and receipt.confirmed then
+                if action.kind=="age" then s.potions+=1
+                elseif action.mode=="claim" then s.rewards+=1 else s.opened+=1 end
+            end
+            local cleaned,cleanError=pcall(ctx.Release,action)
+            s.busy=false;s.stage=nil
+            if not cleaned then s.stopAll();s.error=tostring(cleanError);s.status="Bakım kilidi temizlenemedi";return end
+            if ok and receipt and receipt.confirmed then
+                s.error=nil;s.status=receipt.status or "Sunucu doğruladı"
+            elseif ok and receipt and receipt.rejected then
+                s.error=nil;s.status=receipt.status or "Oyun işlemi kabul etmedi"
+            elseif sent then
+                if action.kind=="crypt" then s.setCrypt(false)else s.setAge(false)end
+                s.error=ok and "İşlem sonucu doğrulanamadı; aynı istek tekrarlanmayacak" or tostring(receipt)
+                s.status=s.error
+            elseif not ok then s.error=tostring(receipt);s.status="İşlem bekliyor: "..s.error end
+            s.nextAt=ctx.Now()+(ok and receipt and receipt.confirmed and 0.5 or 5)
+        end)
+    end
+    return s
+end
+
+    end)()
+    local targets=(function()
+-- Uses replicated native contents; it never rolls/predicts unrevealed floors.
+local targets={}
+function targets.Describe(state,rules,layout)
+    local result={targets={},status="Crypt verisi bekleniyor",final=false}
+    if type(state)~="table" or type(state.floors)~="table" then return result end
+    local opened=layout.opened_set(state.opened)
+    for floor,rule in ipairs(rules)do
+        local contents=state.floors[floor]
+        if type(contents)~="table" or type(contents.coffins)~="table" then
+            result.status="Kat "..floor.." verisi bekleniyor";return result
+        end
+        if rule.is_final then
+            result.final=true;result.status="Son oda · merdivenli mezarlar tamamlandı";return result
+        end
+        local ok,index=pcall(layout.get_ladder_slot,contents)
+        local count=0
+        for _,kind in pairs(contents.coffins)do if kind=="ladder" then count+=1 end end
+        if not ok or type(index)~="number" or index%1~=0 or index<1 or index>rule.coffins or
+            contents.coffins[index]~="ladder" or count~=1 then
+            result.status="Kat "..floor.." merdiven bilgisi doğrulanamadı";return result
+        end
+        local id=layout.padlock_key(floor,index)
+        local isOpened=opened[id]==true
+        table.insert(result.targets,{floor=floor,index=index,id=id,opened=isOpened,
+            room=floor==1 and "StartRoom" or rule.template})
+        result.currentFloor,result.currentIndex=floor,index
+        if not isOpened then
+            result.status="Kat "..floor.." · doğru mezar #"..index;return result
+        end
+    end
+    return result
+end
+function targets.Match(candidates,position,distance)
+    local best,bestDistance=nil,distance or 0.75
+    for _,candidate in ipairs(candidates)do
+        local delta=(candidate.position-position).Magnitude
+        if delta<=bestDistance then best,bestDistance=candidate.model,delta end
+    end
+    return best
+end
+return targets
+
+    end)()
+    local env=getgenv()
+    local load=require(game.ReplicatedStorage.Fsys).load
+    local CD,Tools,Equipped=load("ClientData"),load("ClientToolManager"),load("EquippedPets")
+    local Interiors,Forced=load("InteriorsM"),load("MinigameForcedState")
+    local InventoryDB,Effects=load("InventoryDB"),load("PetPotionEffectsDB")
+    local Actions,Router=load("PetActions"),load("RouterClient")
+    local Creator=load("AdoptMeEnums/PetEntities/PetObjectCreatorType")
+    local Locks=load("BackpackLockTracker")
+    local cryptPackage=game.ReplicatedStorage.SharedModules.ContentPacks.Halloween2026.Game.TheCrypt
+    local constants,layout=require(cryptPackage.CryptConstants),require(cryptPackage.CryptLayout)
+    local Crypt=require(cryptPackage.CryptClient)
+    local player=game.Players.LocalPlayer
+    local ledger=env.BulbulInventoryLedger
+    if not ledger or ledger.owner~=player.UserId or ledger.server~=game.JobId then
+        ledger={owner=player.UserId,server=game.JobId,pending={}};env.BulbulInventoryLedger=ledger
+    end
+    local pauseText="Anahtar / Age-Up işlemi için bakım bekliyor"
+    local ownsPause=false
+    local function inventory()return CD.get("inventory") or {}end
+    local function cryptData()return CD.get(constants.STORE_KEY)end
+    local function keyItem()
+        for _,item in pairs(inventory().toys or {})do if item.kind==constants.KEY_ITEM_KIND then return item end end
+    end
+    local function applied(a)
+        if a.kind=="crypt" then
+            local d=cryptData()
+            if type(d)~="table" or type(d.seed)~="number" then return false end
+            return d.seed~=a.seed or a.mode=="unlock" and layout.opened_set(d.opened)[a.id]==true
+        end
+        local inv=CD.get("inventory")
+        return type(inv)=="table" and type(inv.food)=="table" and inv.food[a.unique]==nil
+    end
+    local function plan(s)
+        for key,a in pairs(ledger.pending)do if applied(a)then ledger.pending[key]=nil end end
+        local loc=Interiors.get_current_location()
+        if s.cryptEnabled and loc and loc.destination_id==constants.DESTINATION_ID then
+            local d=cryptData();local description=targets.Describe(d,constants.FLOORS,layout)
+            local a
+            if description.final then a={kind="crypt",mode="claim",seed=d.seed,key="claim:"..tostring(d.seed)}
+            else
+                for _,t in ipairs(description.targets)do
+                    if not t.opened then
+                        if not keyItem()then return nil,"Crypt anahtarı bekleniyor"end
+                        a={kind="crypt",mode="unlock",seed=d.seed,floor=t.floor,index=t.index,id=t.id,
+                            key="unlock:"..tostring(d.seed)..":"..tostring(t.id)};break
+                    end
+                end
+            end
+            if not a then return nil,description.status end
+            if ledger.pending[a.key]then return nil,"Önceki Crypt işleminin bildirimi bekleniyor"end
+            return a,a.mode=="claim" and "Son Crypt ödülü alınacak" or "Doğru mezar açılacak · Kat "..a.floor
+        end
+        if s.ageEnabled then
+            local snap=care.snapshot()
+            local pet=(inventory().pets or {})[snap.selected]
+            if not pet then return nil,"Age-Up için pet seç"end
+            local def=InventoryDB.pets[pet.kind or pet.id]
+            if not def or def.is_egg then return nil,"Yumurta açılana kadar Age-Up bekliyor"end
+            if def.cannot_feed_potions or pet.properties and pet.properties.temporary then return nil,"Bu pete iksir verilemiyor"end
+            if (pet.properties and pet.properties.age or 0)>=6 then return nil,"Seçili pet yetişkin · Age-Up bekliyor"end
+            local options={}
+            for id,item in pairs(inventory().food or {})do
+                local effect=Effects[item.kind or item.id]
+                if effect and effect.is_age_potion and not Locks.is_locked(item) and
+                    (not def.allowed_potions or table.find(def.allowed_potions,item.kind))then
+                    local key="age:"..tostring(item.unique or id)
+                    if ledger.pending[key]then return nil,"Önceki Age-Up tüketiminin bildirimi bekleniyor"end
+                    table.insert(options,{item=item,unique=item.unique or id,key=key,
+                        rank=item.kind=="tiny_pet_age_potion" and 1 or item.kind=="pet_age_potion" and 2 or 3})
+                end
+            end
+            table.sort(options,function(a,b)return a.rank==b.rank and tostring(a.unique)<tostring(b.unique) or a.rank<b.rank end)
+            local chosen=options[1]
+            if not chosen then return nil,"Envanterde Age-Up iksiri bekleniyor"end
+            return {kind="age",mode="feed",key=chosen.key,unique=chosen.unique,pet=snap.selected},"Seçili pete Age-Up verilecek"
+        end
+        return nil,"Crypt'e girmen bekleniyor"
+    end
+    local function check(valid)assert(valid() and hub.running,"İşlem duraklatıldı.")end
+    local function waitUntil(fn,seconds)
+        local untilAt=os.clock()+seconds
+        repeat if fn()then return true end;task.wait(0.1)until os.clock()>=untilAt
+        return fn()
+    end
+    local state=newLoop({Now=os.clock,Spawn=task.spawn,
+        Allowed=function()
+            local cycle=hub.autoJoin
+            if not hub.running or Forced.is_enabled() or cycle and cycle.phase~="idle" then return false,"Ghost / geçiş sırasında anahtar ve iksir bekliyor"end
+            return true
+        end,Plan=plan,
+        Acquire=function(_,valid)
+            check(valid)
+            assert(not care.snapshot().pauseReason,"Bakım başka bir işlem için bekliyor.")
+            care.setPaused(pauseText);ownsPause=true
+            local deadline=os.clock()+30
+            while not care.isIdle()do check(valid);assert(os.clock()<deadline,"Bakım temizliği bekleniyor.");task.wait(0.1)end
+        end,
+        Run=function(a,valid,markSent)
+            check(valid)
+            if a.kind=="crypt" then
+                local loc=Interiors.get_current_location();local d=cryptData()
+                assert(loc and loc.destination_id==constants.DESTINATION_ID and d and d.seed==a.seed,"Crypt düzeni veya konumu değişti.")
+                if applied(a)then return {rejected=true,status="Mezar zaten açılmış"}end
+                if a.mode=="unlock" then
+                    local key=assert(keyItem(),"Anahtar bulunamadı.")
+                    if not Crypt.is_key_equipped()then
+                        local accepted=Tools.equip(key);assert(accepted,"Anahtar takılamadı.")
+                        assert(waitUntil(Crypt.is_key_equipped,8),"Anahtarın takılması doğrulanmadı.")
+                    end
+                end
+                check(valid)
+                d=cryptData();assert(d and d.seed==a.seed,"Crypt düzeni değişti.")
+                if applied(a)then return {rejected=true,status="Mezar zaten açılmış"}end
+                -- Write the ledger before crossing the native request boundary.
+                ledger.pending[a.key]=a;markSent()
+                local receipt
+                if a.mode=="claim" then receipt=Crypt.claim_tomb_spider_async()
+                else receipt=Crypt.unlock_padlock_async(a.floor,a.index)end
+                if receipt and receipt.ok==false then
+                    ledger.pending[a.key]=nil;return {rejected=true,status="Crypt bekliyor: "..tostring(receipt.reason)}
+                end
+                local confirmed=waitUntil(function()return applied(a)end,12)
+                if confirmed then ledger.pending[a.key]=nil end
+                return {confirmed=confirmed,status=a.mode=="claim" and "Son ödül alındı · yeni Crypt düzeni" or "Doğru mezar açıldı · Kat "..a.floor}
+            end
+            local inv=inventory();local pet=(inv.pets or {})[a.pet]
+            assert(care.snapshot().selected==a.pet and pet,"Seçili pet değişti.")
+            local item=assert((inv.food or {})[a.unique],"İksir artık envanterde değil.")
+            local effect=Effects[item.kind or item.id];assert(effect and effect.is_age_potion,"Age-Up iksiri doğrulanamadı.")
+            assert(effect.validate(nil,pet),"Pet zaten yetişkin veya iksir uygun değil.")
+            local wrapper
+            local function findWrapper()
+                for _,w in pairs(Equipped.get_my_equipped_char_wrappers())do if w.pet_unique==a.pet then return w end end
+            end
+            wrapper=findWrapper()
+            if not wrapper then assert(Tools.equip(pet),"Pet takılamadı.");assert(waitUntil(function()wrapper=findWrapper();return wrapper~=nil end,10),"Pet takılması doğrulanmadı.")end
+            check(valid);assert(care.snapshot().selected==a.pet,"Seçili pet değişti.")
+            pet=assert((inventory().pets or {})[a.pet]);assert(effect.validate(wrapper,pet),"Pet zaten yetişkin.")
+            assert((inventory().food or {})[a.unique],"İksir artık envanterde değil.")
+            assert(not Locks.is_locked(item) and Actions.can_feed_pet(wrapper),"Pet şu anda beslenemiyor.")
+            local beforeAge,beforeXp=pet.properties.age,pet.properties.xp or 0
+            ledger.pending[a.key]=a;markSent()
+            local object=Router.get("PetObjectAPI/CreatePetObject"):InvokeServer(Creator.PetFood,{
+                unique_id=a.unique,pet_unique=a.pet,additional_consume_uniques={},
+                spawn_cframe=wrapper.char:GetPivot()*CFrame.new(0,1,-2)*CFrame.fromAxisAngle(Vector3.new(1,0,0),math.pi/2)})
+            if not object then ledger.pending[a.key]=nil;return {rejected=true,status="Pet besleme isteği kabul edilmedi"}end
+            local confirmed=waitUntil(function()
+                local current=(inventory().pets or {})[a.pet]
+                local props=current and current.properties
+                return applied(a) and props and ((props.age or 0)>beforeAge or (props.xp or 0)>beforeXp)
+            end,25)
+            if confirmed then ledger.pending[a.key]=nil end
+            return {confirmed=confirmed,status="Age-Up tüketimi ve pet büyümesi doğrulandı"}
+        end,
+        Release=function()
+            if ownsPause and care.snapshot().pauseReason==pauseText then care.setPaused(nil)end
+            ownsPause=false
+        end})
+    state.plan=function(settings)return plan(settings or state)end
+    env.BulbulInventoryActive=state
+    task.spawn(function()
+        while state.running do
+            local ok,err=pcall(state.step)
+            if not ok then state.error=tostring(err);state.status="Otomasyon yeniden kontrol ediliyor"end
+            task.wait(0.3)
+        end
+    end)
+    return state
 end
 
 end)()
@@ -6461,7 +6977,7 @@ That Promise was created at:
 ]],self._source)})end self:_reject(...)end)if l._status==h.Status.Cancelled then self:cancel()elseif l._status==h.Status.Started then self._parent=l l._consumers[self]=true end return end self._status=h.Status.Resolved self._valuesLength,self._values=b(...)for k,l in ipairs(self._queuedResolve)do coroutine.wrap(l)(...)end self:_finalize()end function h.prototype:_reject(...)if self._status~=h.Status.Started then return end self._status=h.Status.Rejected self._valuesLength,self._values=b(...)if not g(self._queuedReject)then for k,l in ipairs(self._queuedReject)do coroutine.wrap(l)(...)end else local k=tostring((...))coroutine.wrap(function()h._timeEvent:Wait()if not self._unhandledRejection then return end local l=string.format('Unhandled Promise rejection:\n\n%s\n\n%s',k,self._source)for m,n in ipairs(h._unhandledRejectionCallbacks)do task.spawn(n,self,unpack(self._values,1,self._valuesLength))end if h.TEST then return end warn(l)end)()end self:_finalize()end function h.prototype:_finalize()for k,l in ipairs(self._queuedFinally)do coroutine.wrap(l)(self._status)end self._queuedFinally=nil self._queuedReject=nil self._queuedResolve=nil if not h.TEST then self._parent=nil self._consumers=nil end task.defer(coroutine.close,self._thread)end function h.prototype:now(k)local l=debug.traceback(nil,2)if self._status==h.Status.Resolved then return self:_andThen(l,function(...)return...end)else return h.reject(k==nil and ag.new{kind=ag.Kind.NotResolvedInTime,error='This Promise was not resolved in time for :now()',context=':now() was called at:\n\n'..l}or k)end end function h.retry(k,l,...)assert(ae(k),'Parameter #1 to Promise.retry must be a function')assert(type(l)=='number','Parameter #2 to Promise.retry must be a number')local m,n={...},select('#',...)return h.resolve(k(...)):catch(function(...)if l>0 then return h.retry(k,l-1,unpack(m,1,n))else return h.reject(...)end end)end function h.retryWithDelay(k,l,m,...)assert(ae(k),'Parameter #1 to Promise.retry must be a function')assert(type(l)=='number','Parameter #2 (times) to Promise.retry must be a number')assert(type(m)=='number','Parameter #3 (seconds) to Promise.retry must be a number')local n,o={...},select('#',...)return h.resolve(k(...)):catch(function(...)if l>0 then h.delay(m):await()return h.retryWithDelay(k,l-1,m,unpack(n,1,o))else return h.reject(...)end end)end function h.fromEvent(k,l)l=l or function()return true end return h._new(debug.traceback(nil,2),function(m,n,o)local p,q=false local function r()q:Disconnect()q=nil end q=k:Connect(function(...)local s=l(...)if s==true then m(...)if q then r()else p=true end elseif type(s)~='boolean'then error'Promise.fromEvent predicate should always return a boolean'end end)if p and q then return r()end o(r)end)end function h.onUnhandledRejection(k)table.insert(h._unhandledRejectionCallbacks,k)return function()local l=table.find(h._unhandledRejectionCallbacks,k)if l then table.remove(h._unhandledRejectionCallbacks,l)end end end return h end)()end,[96]=function()local aa,ab,ac=a(96)return(function(...)return function()local ad=ac(ab.Parent)ad.TEST=true local ae=Instance.new'BindableEvent'ad._timeEvent=ae.Event local af do local ag=0 ad._getTime=function()return ag end function af(b)b=b or(1.6666666666666665E-2)ag=ag+b ae:Fire(b)end end local function ag(...)local b=select('#',...)return b,{...}end describe('Promise.Status',function()it('should error if indexing nil value',function()expect(function()local b=ad.Status.wrong end).to.throw()end)end)describe('Unhandled rejection signal',function()it('should call unhandled rejection callbacks',function()local b,c=ad.new(function(b,c)c(1,2)end),0 local function d(e,f,g)c+=1 expect(e).to.equal(b)expect(f).to.equal(1)expect(g).to.equal(2)end local e=ad.onUnhandledRejection(d)af()expect(c).to.equal(1)e()ad.new(function(f,g)g(3,4)end)af()expect(c).to.equal(1)end)end)describe('Promise.new',function()it('should instantiate with a callback',function()local b=ad.new(function()end)expect(b).to.be.ok()end)it('should invoke the given callback with resolve and reject',function()local b,c,d=0 local e=ad.new(function(e,f)b=b+1 c=e d=f end)expect(e).to.be.ok()expect(b).to.equal(1)expect(c).to.be.a'function'expect(d).to.be.a'function'expect(e:getStatus()).to.equal(ad.Status.Started)end)it('should resolve promises on resolve()',function()local b=0 local c=ad.new(function(c)b=b+1 c()end)expect(c).to.be.ok()expect(b).to.equal(1)expect(c:getStatus()).to.equal(ad.Status.Resolved)end)it('should reject promises on reject()',function()local b=0 local c=ad.new(function(c,d)b=b+1 d()end)expect(c).to.be.ok()expect(b).to.equal(1)expect(c:getStatus()).to.equal(ad.Status.Rejected)end)it('should reject on error in callback',function()local b=0 local c=ad.new(function()b=b+1 error'hahah'end)expect(c).to.be.ok()expect(b).to.equal(1)expect(c:getStatus()).to.equal(ad.Status.Rejected)expect(tostring(c._values[1]):find'hahah').to.be.ok()expect(tostring(c._values[1]):find'init.spec').to.be.ok()expect(tostring(c._values[1]):find'runExecutor').to.be.ok()end)it('should work with C functions',function()expect(function()ad.new(tick):andThen(tick)end).to.never.throw()end)it('should have a nice tostring',function()expect(tostring(ad.resolve()):gmatch'Promise(Resolved)').to.be.ok()end)it('should allow yielding',function()local b=Instance.new'BindableEvent'local c=ad.new(function(c)b.Event:Wait()c(5)end)expect(c:getStatus()).to.equal(ad.Status.Started)b:Fire()expect(c:getStatus()).to.equal(ad.Status.Resolved)expect(c._values[1]).to.equal(5)end)it('should preserve stack traces of resolve-chained promises',function()local function b(c)error(c)end local c=ad.new(function(c)c(ad.new(function()b'sample text'end))end)expect(c:getStatus()).to.equal(ad.Status.Rejected)local d=tostring(c._values[1])expect(d:find'sample text').to.be.ok()expect(d:find'nestedCall').to.be.ok()expect(d:find'runExecutor').to.be.ok()expect(d:find'runPlanNode').to.be.ok()expect(d:find[[...Rejected because it was chained to the following Promise, which encountered an error:]]).to.be.ok()end)it('should report errors from Promises with _error (< v2)',function()local b=ad.reject()b._error='Sample error'local c=ad.resolve():andThenReturn(b)expect(c:getStatus()).to.equal(ad.Status.Rejected)local d=tostring(c._values[1])expect(d:find'Sample error').to.be.ok()expect(d:find[[...Rejected because it was chained to the following Promise, which encountered an error:]]).to.be.ok()expect(d:find'%[No stack trace available').to.be.ok()end)it('should allow callable tables',function()local b,c=ad.new(setmetatable({},{__call=function(b,c)c(1)end})),false b:andThen(setmetatable({},{__call=function(d,e)expect(e).to.equal(1)c=true end}))expect(c).to.equal(true)end)itSKIP('should close the thread after resolve',function()local b=0 ad.new(function(c)b+=1 c()ad.delay(1):await()b+=1 end)task.wait(1)expect(b).to.equal(1)end)end)describe('Promise.defer',function()it('should execute after the time event',function()local b=0 local c=ad.defer(function(c,d,e,f)expect(type(c)).to.equal'function'expect(type(d)).to.equal'function'expect(type(e)).to.equal'function'expect(type(f)).to.equal'nil'b=b+1 c'foo'end)expect(b).to.equal(0)expect(c:getStatus()).to.equal(ad.Status.Started)af()expect(b).to.equal(1)expect(c:getStatus()).to.equal(ad.Status.Resolved)af()expect(b).to.equal(1)end)end)describe('Promise.delay',function()it('should schedule promise resolution',function()local b=ad.delay(1)expect(b:getStatus()).to.equal(ad.Status.Started)af()expect(b:getStatus()).to.equal(ad.Status.Started)af(1)expect(b:getStatus()).to.equal(ad.Status.Resolved)end)it('should allow for delays to be cancelled',function()local b=ad.delay(2)ad.delay(1):andThen(function()b:cancel()end)expect(b:getStatus()).to.equal(ad.Status.Started)af()expect(b:getStatus()).to.equal(ad.Status.Started)af(1)expect(b:getStatus()).to.equal(ad.Status.Cancelled)af(1)end)end)describe('Promise.resolve',function()it('should immediately resolve with a value',function()local b=ad.resolve(5,6)expect(b).to.be.ok()expect(b:getStatus()).to.equal(ad.Status.Resolved)expect(b._values[1]).to.equal(5)expect(b._values[2]).to.equal(6)end)it('should chain onto passed promises',function()local b=ad.resolve(ad.new(function(b,c)c(7)end))expect(b).to.be.ok()expect(b:getStatus()).to.equal(ad.Status.Rejected)expect(b._values[1]).to.equal(7)end)end)describe('Promise.reject',function()it('should immediately reject with a value',function()local b=ad.reject(6,7)expect(b).to.be.ok()expect(b:getStatus()).to.equal(ad.Status.Rejected)expect(b._values[1]).to.equal(6)expect(b._values[2]).to.equal(7)end)it('should pass a promise as-is as an error',function()local b=ad.new(function(b)b(6)end)local c=ad.reject(b)expect(c).to.be.ok()expect(c:getStatus()).to.equal(ad.Status.Rejected)expect(c._values[1]).to.equal(b)end)end)describe('Promise:andThen',function()it('should allow yielding',function()local b=Instance.new'BindableEvent'local c=ad.resolve():andThen(function()b.Event:Wait()return 5 end)expect(c:getStatus()).to.equal(ad.Status.Started)b:Fire()expect(c:getStatus()).to.equal(ad.Status.Resolved)expect(c._values[1]).to.equal(5)end)it('should run andThens on a new thread',function()local b,c=(Instance.new'BindableEvent')local d=ad.new(function(d)c=d end)local e,f=d:andThen(function()b.Event:Wait()return 5 end),d:andThen(function()return'foo'end)expect(d:getStatus()).to.equal(ad.Status.Started)c()expect(f:getStatus()).to.equal(ad.Status.Resolved)expect(f._values[1]).to.equal'foo'expect(e:getStatus()).to.equal(ad.Status.Started)end)it('should chain onto resolved promises',function()local b,c,d,e,f=0,0,(ad.resolve(5))local g=d:andThen(function(...)f,e=ag(...)b=b+1 end,function()c=c+1 end)expect(c).to.equal(0)expect(b).to.equal(1)expect(f).to.equal(1)expect(e[1]).to.equal(5)expect(d).to.be.ok()expect(d:getStatus()).to.equal(ad.Status.Resolved)expect(d._values[1]).to.equal(5)expect(g).to.be.ok()expect(g).never.to.equal(d)expect(g:getStatus()).to.equal(ad.Status.Resolved)expect(#g._values).to.equal(0)end)it('should chain onto rejected promises',function()local b,c,d,e,f=0,0,(ad.reject(5))local g=d:andThen(function(...)c=c+1 end,function(...)f,e=ag(...)b=b+1 end)expect(c).to.equal(0)expect(b).to.equal(1)expect(f).to.equal(1)expect(e[1]).to.equal(5)expect(d).to.be.ok()expect(d:getStatus()).to.equal(ad.Status.Rejected)expect(d._values[1]).to.equal(5)expect(g).to.be.ok()expect(g).never.to.equal(d)expect(g:getStatus()).to.equal(ad.Status.Resolved)expect(#g._values).to.equal(0)end)it('should reject on error in callback',function()local b=0 local c=ad.resolve(1):andThen(function()b=b+1 error'hahah'end)expect(c).to.be.ok()expect(b).to.equal(1)expect(c:getStatus()).to.equal(ad.Status.Rejected)expect(tostring(c._values[1]):find'hahah').to.be.ok()expect(tostring(c._values[1]):find'init.spec').to.be.ok()expect(tostring(c._values[1]):find'runExecutor').to.be.ok()end)it('should chain onto asynchronously resolved promises',function()local b,c,d,e,f=0,0 local g=ad.new(function(g)f=g end)local h=g:andThen(function(...)d={...}e=select('#',...)b=b+1 end,function()c=c+1 end)expect(b).to.equal(0)expect(c).to.equal(0)f(6)expect(c).to.equal(0)expect(b).to.equal(1)expect(e).to.equal(1)expect(d[1]).to.equal(6)expect(g).to.be.ok()expect(g:getStatus()).to.equal(ad.Status.Resolved)expect(g._values[1]).to.equal(6)expect(h).to.be.ok()expect(h).never.to.equal(g)expect(h:getStatus()).to.equal(ad.Status.Resolved)expect(#h._values).to.equal(0)end)it('should chain onto asynchronously rejected promises',function()local b,c,d,e,f=0,0 local g=ad.new(function(g,h)f=h end)local h=g:andThen(function()c=c+1 end,function(...)d={...}e=select('#',...)b=b+1 end)expect(b).to.equal(0)expect(c).to.equal(0)f(6)expect(c).to.equal(0)expect(b).to.equal(1)expect(e).to.equal(1)expect(d[1]).to.equal(6)expect(g).to.be.ok()expect(g:getStatus()).to.equal(ad.Status.Rejected)expect(g._values[1]).to.equal(6)expect(h).to.be.ok()expect(h).never.to.equal(g)expect(h:getStatus()).to.equal(ad.Status.Resolved)expect(#h._values).to.equal(0)end)it('should propagate errors through multiple levels',function()local b,c,d ad.new(function(e,f)f(1,2,3)end):andThen(function()end):catch(function(e,f,g)b,c,d=e,f,g end)expect(b).to.equal(1)expect(c).to.equal(2)expect(d).to.equal(3)end)it([[should not call queued callbacks from a cancelled sub-promise]],function()local b,c=0 local d=ad.new(function(d)c=d end)d:andThen(function()b+=1 end)d:andThen(function()b+=1 end):cancel()c'foo'expect(b).to.equal(1)end)end)describe('Promise:cancel',function()it([[should mark promises as cancelled and not resolve or reject them]],function()local b,c=0,0 local d=ad.new(function()end):andThen(function()b=b+1 end):finally(function()c=c+1 end)d:cancel()d:cancel()expect(b).to.equal(0)expect(c).to.equal(1)expect(d:getStatus()).to.equal(ad.Status.Cancelled)end)it('should call the cancellation hook once',function()local b=0 local c=ad.new(function(c,d,e)e(function()b=b+1 end)end)c:cancel()c:cancel()expect(b).to.equal(1)end)it('should propagate cancellations',function()local b=ad.new(function()end)local c,d=b:andThen(),b:andThen()expect(b:getStatus()).to.equal(ad.Status.Started)expect(c:getStatus()).to.equal(ad.Status.Started)expect(d:getStatus()).to.equal(ad.Status.Started)c:cancel()expect(b:getStatus()).to.equal(ad.Status.Started)expect(c:getStatus()).to.equal(ad.Status.Cancelled)expect(d:getStatus()).to.equal(ad.Status.Started)d:cancel()expect(b:getStatus()).to.equal(ad.Status.Cancelled)expect(c:getStatus()).to.equal(ad.Status.Cancelled)expect(d:getStatus()).to.equal(ad.Status.Cancelled)end)it('should affect downstream promises',function()local b=ad.new(function()end)local c=b:andThen()b:cancel()expect(c:getStatus()).to.equal(ad.Status.Cancelled)end)it('should track consumers',function()local b,c=ad.new(function()end),ad.resolve()local d=c:andThen(function()return b end)local e=ad.new(function(e)e(d)end)local f=e:andThen(function()end)expect(d._parent).to.never.equal(c)expect(e._parent).to.never.equal(d)expect(e._consumers[f]).to.be.ok()expect(f._parent).to.equal(e)end)it('should cancel resolved pending promises',function()local b=ad.new(function()end)local c=ad.new(function(c)c(b)end):finally(function()end)c:cancel()expect(b._status).to.equal(ad.Status.Cancelled)expect(c._status).to.equal(ad.Status.Cancelled)end)it('should close the promise thread',function()local b=0 local c=ad.new(function()b+=1 ad.delay(1):await()b+=1 end)c:cancel()af(2)expect(b).to.equal(1)end)end)describe('Promise:finally',function()it('should be called upon resolve, reject, or cancel',function()local b=0 local function c()b=b+1 end ad.new(function(d,e)d()end):finally(c)ad.resolve():andThen(function()end):finally(c):finally(c)ad.reject():finally(c)local d=ad.new(function()end):finally(c)d:cancel()expect(b).to.equal(5)end)it('should not forward return values',function()local b ad.resolve(2):finally(function()return 1 end):andThen(function(c)b=c end)expect(b).to.equal(2)end)it('should not consume rejections',function()local b,c=false,false ad.reject(5):finally(function()return 42 end):andThen(function()c=true end):catch(function(d)b=true expect(d).to.equal(5)end)expect(b).to.equal(true)expect(c).to.equal(false)end)it('should wait for returned promises',function()local b local c=ad.reject'foo':finally(function()return ad.new(function(c)b=c end)end)expect(c:getStatus()).to.equal(ad.Status.Started)b()expect(c:getStatus()).to.equal(ad.Status.Rejected)local d,e=c:_unwrap()expect(e).to.equal'foo'end)it("should reject with a returned rejected promise's value",function()local b local c=ad.reject'foo':finally(function()return ad.new(function(c,d)b=d end)end)expect(c:getStatus()).to.equal(ad.Status.Started)b'bar'expect(c:getStatus()).to.equal(ad.Status.Rejected)local d,e=c:_unwrap()expect(e).to.equal'bar'end)it('should reject when handler errors',function()local b={}local c=ad.reject'bar':finally(function()error(b)end)local d,e=c:_unwrap()expect(d).to.equal(false)expect(e).to.equal(b)end)it('should not prevent cancellation',function()local b,c=ad.new(function()end),false b:finally(function()c=true end)local d=b:andThen(function()end)d:cancel()expect(b:getStatus()).to.equal(ad.Status.Cancelled)expect(c).to.equal(true)end)it('should propagate cancellation downwards',function()local b,c,d=false,false,ad.new(function()end)local e=d:finally(function()b=true end)d:cancel()expect(d:getStatus()).to.equal(ad.Status.Cancelled)expect(e:getStatus()).to.equal(ad.Status.Cancelled)expect(b).to.equal(true)expect(c).to.equal(false)end)it('should propagate cancellation upwards',function()local b,c,d=false,false,ad.new(function()end)local e=d:finally(function()b=true end)e:cancel()expect(d:getStatus()).to.equal(ad.Status.Cancelled)expect(e:getStatus()).to.equal(ad.Status.Cancelled)expect(b).to.equal(true)expect(c).to.equal(false)end)it('should cancel returned promise if cancelled',function()local b=ad.new(function()end)local c=ad.resolve():finally(function()return b end)c:cancel()expect(b:getStatus()).to.equal(ad.Status.Cancelled)end)end)describe('Promise.all',function()it('should error if given something other than a table',function()expect(function()ad.all(1)end).to.throw()end)it([[should resolve instantly with an empty table if given no promises]],function()local b=ad.all{}local c,d=b:_unwrap()expect(c).to.equal(true)expect(b:getStatus()).to.equal(ad.Status.Resolved)expect(d).to.be.a'table'expect(next(d)).to.equal(nil)end)it('should error if given non-promise values',function()expect(function()ad.all{{},{},{}}end).to.throw()end)it([[should wait for all promises to be resolved and return their values]],function()local b,c,d={},ag(1,'A string',nil,false)local e={}for f=1,c do e[f]=ad.new(function(g)b[f]={g,d[f]}end)end local f=ad.all(e)for g,h in ipairs(b)do expect(f:getStatus()).to.equal(ad.Status.Started)h[1](h[2])end local g,h=ag(f:_unwrap())local i,j=unpack(h,1,g)expect(g).to.equal(2)expect(i).to.equal(true)expect(j).to.be.a'table'expect(#j).to.equal(#e)for k=1,c do expect(j[k]).to.equal(d[k])end end)it('should reject if any individual promise rejected',function()local b,c local d,e=ad.new(function(d,e)b=e end),ad.new(function(d)c=d end)local f=ad.all{d,e}expect(f:getStatus()).to.equal(ad.Status.Started)b('baz','qux')c('foo','bar')local g,h=ag(f:_unwrap())local i,j,k=unpack(h,1,g)expect(g).to.equal(3)expect(i).to.equal(false)expect(j).to.equal'baz'expect(k).to.equal'qux'expect(e:getStatus()).to.equal(ad.Status.Cancelled)end)it('should not resolve if resolved after rejecting',function()local b,c local d,e=ad.new(function(d,e)b=e end),ad.new(function(d)c=d end)local f=ad.all{d,e}expect(f:getStatus()).to.equal(ad.Status.Started)b('baz','qux')c('foo','bar')local g,h=ag(f:_unwrap())local i,j,k=unpack(h,1,g)expect(g).to.equal(3)expect(i).to.equal(false)expect(j).to.equal'baz'expect(k).to.equal'qux'end)it('should only reject once',function()local b,c local d,e=ad.new(function(d,e)b=e end),ad.new(function(d,e)c=e end)local f=ad.all{d,e}expect(f:getStatus()).to.equal(ad.Status.Started)b('foo','bar')expect(f:getStatus()).to.equal(ad.Status.Rejected)c('baz','qux')local g,h=ag(f:_unwrap())local i,j,k=unpack(h,1,g)expect(g).to.equal(3)expect(i).to.equal(false)expect(j).to.equal'foo'expect(k).to.equal'bar'end)it('should error if a non-array table is passed in',function()local b,c=pcall(function()ad.all(ad.new(function()end))end)expect(b).to.be.ok()expect(c:find'Non%-promise').to.be.ok()end)it('should cancel pending promises if one rejects',function()local b=ad.new(function()end)expect(ad.all{ad.resolve(),ad.reject(),b}:getStatus()).to.equal(ad.Status.Rejected)expect(b:getStatus()).to.equal(ad.Status.Cancelled)end)it('should cancel promises if it is cancelled',function()local b=ad.new(function()end)b:andThen(function()end)local c={ad.new(function()end),ad.new(function()end),b}ad.all(c):cancel()expect(c[1]:getStatus()).to.equal(ad.Status.Cancelled)expect(c[2]:getStatus()).to.equal(ad.Status.Cancelled)expect(c[3]:getStatus()).to.equal(ad.Status.Started)end)end)describe('Promise.fold',function()it([[should return the initial value in a promise when the list is empty]],function()local b={}local c=ad.fold({},function()error'should not be called'end,b)expect(ad.is(c)).to.equal(true)expect(c:getStatus()).to.equal(ad.Status.Resolved)expect(c:expect()).to.equal(b)end)it('should accept promises in the list',function()local b local c=ad.fold({ad.new(function(c)b=c end),2,3},function(c,d)return c+d end,0)b(1)expect(ad.is(c)).to.equal(true)expect(c:getStatus()).to.equal(ad.Status.Resolved)expect(c:expect()).to.equal(6)end)it([[should always return a promise even if the list or reducer don't use them]],function()local b=ad.fold({1,2,3},function(b,c,d)if d==2 then return ad.delay(1):andThenReturn(b+c)else return b+c end end,0)expect(ad.is(b)).to.equal(true)expect(b:getStatus()).to.equal(ad.Status.Started)af(2)expect(b:getStatus()).to.equal(ad.Status.Resolved)expect(b:expect()).to.equal(6)end)it('should return the first rejected promise',function()local b='foo'local c=ad.fold({1,2,3},function(c,d,e)if e==2 then return ad.reject(b)else return c+d end end,0)expect(ad.is(c)).to.equal(true)local d,e=c:awaitStatus()expect(d).to.equal(ad.Status.Rejected)expect(e).to.equal(b)end)it('should return the first canceled promise',function()local b local c=ad.fold({1,2,3},function(c,d,e)if e==1 then return c+d elseif e==2 then b=ad.delay(1):andThenReturn(c+d)return b else error'this should not run if the promise is cancelled'end end,0)expect(ad.is(c)).to.equal(true)expect(c:getStatus()).to.equal(ad.Status.Started)b:cancel()expect(c:getStatus()).to.equal(ad.Status.Cancelled)end)end)describe('Promise.race',function()it('should resolve with the first settled value',function()local b=ad.race{ad.resolve(1),ad.resolve(2)}:andThen(function(b)expect(b).to.equal(1)end)expect(b:getStatus()).to.equal(ad.Status.Resolved)end)it('should cancel other promises',function()local b=ad.new(function()end)b:andThen(function()end)local c={b,ad.new(function()end),ad.new(function(c)c(2)end)}local d=ad.race(c)expect(d:getStatus()).to.equal(ad.Status.Resolved)expect(d._values[1]).to.equal(2)expect(c[1]:getStatus()).to.equal(ad.Status.Started)expect(c[2]:getStatus()).to.equal(ad.Status.Cancelled)expect(c[3]:getStatus()).to.equal(ad.Status.Resolved)local e=ad.new(function()end)expect(ad.race{ad.reject(),ad.resolve(),e}:getStatus()).to.equal(ad.Status.Rejected)expect(e:getStatus()).to.equal(ad.Status.Cancelled)end)it('should error if a non-array table is passed in',function()local c,d=pcall(function()ad.race(ad.new(function()end))end)expect(c).to.be.ok()expect(d:find'Non%-promise').to.be.ok()end)it('should cancel promises if it is cancelled',function()local c=ad.new(function()end)c:andThen(function()end)local d={ad.new(function()end),ad.new(function()end),c}ad.race(d):cancel()expect(d[1]:getStatus()).to.equal(ad.Status.Cancelled)expect(d[2]:getStatus()).to.equal(ad.Status.Cancelled)expect(d[3]:getStatus()).to.equal(ad.Status.Started)end)end)describe('Promise.promisify',function()it('should wrap functions',function()local function c(d)return d+1 end local d=ad.promisify(c)local e=d(1)local f,g=e:_unwrap()expect(f).to.equal(true)expect(e:getStatus()).to.equal(ad.Status.Resolved)expect(g).to.equal(2)end)it('should catch errors after a yield',function()local c=Instance.new'BindableEvent'local d=ad.promisify(function()c.Event:Wait()error'errortext'end)local e=d()expect(e:getStatus()).to.equal(ad.Status.Started)c:Fire()expect(e:getStatus()).to.equal(ad.Status.Rejected)expect(tostring(e._values[1]):find'errortext').to.be.ok()end)end)describe('Promise.tap',function()it('should thread through values',function()local c,d ad.resolve(1):andThen(function(e)return e+1 end):tap(function(e)c=e return e+1 end):andThen(function(e)d=e end)expect(c).to.equal(2)expect(d).to.equal(2)end)it('should chain onto promises',function()local c,d local e=ad.resolve(1):tap(function()return ad.new(function(e)c=e end)end):andThen(function(e)d=e end)expect(e:getStatus()).to.equal(ad.Status.Started)expect(d).to.never.be.ok()c(1)expect(e:getStatus()).to.equal(ad.Status.Resolved)expect(d).to.equal(1)end)end)describe('Promise.try',function()it('should catch synchronous errors',function()local c ad.try(function()error'errortext'end):catch(function(d)c=tostring(d)end)expect(c:find'errortext').to.be.ok()end)it('should reject with error objects',function()local c={}local d,e=ad.try(function()error(c)end):_unwrap()expect(d).to.equal(false)expect(e).to.equal(c)end)it('should catch asynchronous errors',function()local c=Instance.new'BindableEvent'local d=ad.try(function()c.Event:Wait()error'errortext'end)expect(d:getStatus()).to.equal(ad.Status.Started)c:Fire()expect(d:getStatus()).to.equal(ad.Status.Rejected)expect(tostring(d._values[1]):find'errortext').to.be.ok()end)end)describe('Promise:andThenReturn',function()it('should return the given values',function()local c,d ad.resolve():andThenReturn(1,2):andThen(function(e,f)c=e d=f end)expect(c).to.equal(1)expect(d).to.equal(2)end)end)describe('Promise:andThenCall',function()it('should call the given function with arguments',function()local c,d ad.resolve():andThenCall(function(e,f)c=e d=f end,3,4)expect(c).to.equal(3)expect(d).to.equal(4)end)end)describe('Promise.some',function()it('should resolve once the goal is reached',function()local c=ad.some({ad.resolve(1),ad.reject(),ad.resolve(2)},2)expect(c:getStatus()).to.equal(ad.Status.Resolved)expect(c._values[1][1]).to.equal(1)expect(c._values[1][2]).to.equal(2)end)it("should error if the goal can't be reached",function()expect(ad.some({ad.resolve(),ad.reject()},2):getStatus()).to.equal(ad.Status.Rejected)local c local d=ad.some({ad.resolve(),ad.new(function(d,e)c=e end)},2)expect(d:getStatus()).to.equal(ad.Status.Started)c'foo'expect(d:getStatus()).to.equal(ad.Status.Rejected)expect(d._values[1]).to.equal'foo'end)it('should cancel pending Promises once the goal is reached',function()local c,d=(ad.new(function()end))local e=ad.new(function(e)d=e end)local f=ad.some({c,e,ad.resolve()},2)expect(f:getStatus()).to.equal(ad.Status.Started)expect(c:getStatus()).to.equal(ad.Status.Started)expect(e:getStatus()).to.equal(ad.Status.Started)d()expect(f:getStatus()).to.equal(ad.Status.Resolved)expect(c:getStatus()).to.equal(ad.Status.Cancelled)expect(e:getStatus()).to.equal(ad.Status.Resolved)end)it('should error if passed a non-number',function()expect(function()ad.some({},'non-number')end).to.throw()end)it('should return an empty array if amount is 0',function()local c=ad.some({ad.resolve(2)},0)expect(c:getStatus()).to.equal(ad.Status.Resolved)expect(#c._values[1]).to.equal(0)end)it('should not return extra values',function()local c=ad.some({ad.resolve(1),ad.resolve(2),ad.resolve(3),ad.resolve(4)},2)expect(c:getStatus()).to.equal(ad.Status.Resolved)expect(#c._values[1]).to.equal(2)expect(c._values[1][1]).to.equal(1)expect(c._values[1][2]).to.equal(2)end)it('should cancel promises if it is cancelled',function()local c=ad.new(function()end)c:andThen(function()end)local d={ad.new(function()end),ad.new(function()end),c}ad.some(d,3):cancel()expect(d[1]:getStatus()).to.equal(ad.Status.Cancelled)expect(d[2]:getStatus()).to.equal(ad.Status.Cancelled)expect(d[3]:getStatus()).to.equal(ad.Status.Started)end)describe('Promise.any',function()it('should return the value directly',function()local c=ad.any{ad.reject(),ad.reject(),ad.resolve(1)}expect(c:getStatus()).to.equal(ad.Status.Resolved)expect(c._values[1]).to.equal(1)end)it('should error if all are rejected',function()expect(ad.any{ad.reject(),ad.reject(),ad.reject()}:getStatus()).to.equal(ad.Status.Rejected)end)end)end)describe('Promise.allSettled',function()it('should resolve with an array of PromiseStatuses',function()local c local d=ad.allSettled{ad.resolve(),ad.reject(),ad.resolve(),ad.new(function(d,e)c=e end)}expect(d:getStatus()).to.equal(ad.Status.Started)c()expect(d:getStatus()).to.equal(ad.Status.Resolved)expect(d._values[1][1]).to.equal(ad.Status.Resolved)expect(d._values[1][2]).to.equal(ad.Status.Rejected)expect(d._values[1][3]).to.equal(ad.Status.Resolved)expect(d._values[1][4]).to.equal(ad.Status.Rejected)end)it('should cancel promises if it is cancelled',function()local c=ad.new(function()end)c:andThen(function()end)local d={ad.new(function()end),ad.new(function()end),c}ad.allSettled(d):cancel()expect(d[1]:getStatus()).to.equal(ad.Status.Cancelled)expect(d[2]:getStatus()).to.equal(ad.Status.Cancelled)expect(d[3]:getStatus()).to.equal(ad.Status.Started)end)end)describe('Promise:await',function()it('should return the correct values',function()local c=ad.resolve(5,6,nil,7)local d,e,f,g,h=c:await()expect(d).to.equal(true)expect(e).to.equal(5)expect(f).to.equal(6)expect(g).to.equal(nil)expect(h).to.equal(7)end)it('should work if yielding is needed',function()local c=false task.spawn(function()local d,e=ad.delay(1):await()expect(type(e)).to.equal'number'c=true end)af(2)expect(c).to.equal(true)end)end)describe('Promise:expect',function()it('should throw the correct values',function()local c={}local d=ad.reject(c)local e,f=pcall(function()d:expect()end)expect(e).to.equal(false)expect(f).to.equal(c)end)end)describe('Promise:now',function()it('should resolve if the Promise is resolved',function()local c,d=ad.resolve'foo':now():_unwrap()expect(c).to.equal(true)expect(d).to.equal'foo'end)it('should reject if the Promise is not resolved',function()local c,d=ad.new(function()end):now():_unwrap()expect(c).to.equal(false)expect(ad.Error.isKind(d,'NotResolvedInTime')).to.equal(true)end)it('should reject with a custom rejection value',function()local c,d=ad.new(function()end):now'foo':_unwrap()expect(c).to.equal(false)expect(d).to.equal'foo'end)end)describe('Promise.each',function()it('should iterate',function()local c,d=ad.each({'foo','bar','baz','qux'},function(...)return{...}end):_unwrap()expect(c).to.equal(true)expect(d[1][1]).to.equal'foo'expect(d[1][2]).to.equal(1)expect(d[2][1]).to.equal'bar'expect(d[2][2]).to.equal(2)expect(d[3][1]).to.equal'baz'expect(d[3][2]).to.equal(3)expect(d[4][1]).to.equal'qux'expect(d[4][2]).to.equal(4)end)it('should iterate serially',function()local c,d={},{}local e=ad.each({'foo','bar','baz'},function(e,f)d[f]=(d[f]or 0)+1 return ad.new(function(g)table.insert(c,function()g(e:upper())end)end)end)expect(e:getStatus()).to.equal(ad.Status.Started)expect(#c).to.equal(1)expect(d[1]).to.equal(1)expect(d[2]).to.never.be.ok()table.remove(c,1)()expect(e:getStatus()).to.equal(ad.Status.Started)expect(#c).to.equal(1)expect(d[1]).to.equal(1)expect(d[2]).to.equal(1)expect(d[3]).to.never.be.ok()table.remove(c,1)()expect(e:getStatus()).to.equal(ad.Status.Started)expect(d[1]).to.equal(1)expect(d[2]).to.equal(1)expect(d[3]).to.equal(1)table.remove(c,1)()expect(e:getStatus()).to.equal(ad.Status.Resolved)expect(type(e._values[1])).to.equal'table'expect(type(e._values[2])).to.equal'nil'local f=e._values[1]expect(f[1]).to.equal'FOO'expect(f[2]).to.equal'BAR'expect(f[3]).to.equal'BAZ'end)it([[should reject with the value if the predicate promise rejects]],function()local c=ad.each({1,2,3},function()return ad.reject'foobar'end)expect(c:getStatus()).to.equal(ad.Status.Rejected)expect(c._values[1]).to.equal'foobar'end)it([[should allow Promises to be in the list and wait when it gets to them]],function()local c local d=ad.new(function(d)c=d end)local e=ad.each({d},function(e)return e*2 end)expect(e:getStatus()).to.equal(ad.Status.Started)c(2)expect(e:getStatus()).to.equal(ad.Status.Resolved)expect(e._values[1][1]).to.equal(4)end)it([[should reject with the value if a Promise from the list rejects]],function()local c=false local d=ad.each({1,2,ad.reject'foobar'},function(d)c=true return'never'end)expect(d:getStatus()).to.equal(ad.Status.Rejected)expect(d._values[1]).to.equal'foobar'expect(c).to.equal(false)end)it([[should reject immediately if there's a cancelled Promise in the list initially]],function()local c=ad.new(function()end)c:cancel()local d=false local e=ad.each({1,2,c},function()d=true end)expect(e:getStatus()).to.equal(ad.Status.Rejected)expect(d).to.equal(false)expect(e._values[1].kind).to.equal(ad.Error.Kind.AlreadyCancelled)end)it('should stop iteration if Promise.each is cancelled',function()local c={}local d=ad.each({'foo','bar','baz'},function(d,e)c[e]=(c[e]or 0)+1 return ad.new(function()end)end)expect(d:getStatus()).to.equal(ad.Status.Started)expect(c[1]).to.equal(1)expect(c[2]).to.never.be.ok()d:cancel()expect(d:getStatus()).to.equal(ad.Status.Cancelled)expect(c[1]).to.equal(1)expect(c[2]).to.never.be.ok()end)it([[should cancel the Promise returned from the predicate if Promise.each is cancelled]],function()local c local d=ad.each({'foo','bar','baz'},function(d,e)c=ad.new(function()end)return c end)d:cancel()expect(c:getStatus()).to.equal(ad.Status.Cancelled)end)it([[should cancel Promises in the list if Promise.each is cancelled]],function()local c=ad.new(function()end)local d=ad.each({c},function()end)d:cancel()expect(c:getStatus()).to.equal(ad.Status.Cancelled)end)end)describe('Promise.retry',function()it('should retry N times',function()local c=0 local d=ad.retry(function(d)expect(d).to.equal'foo'c=c+1 if c==5 then return ad.resolve'ok'end return ad.reject'fail'end,5,'foo')expect(d:getStatus()).to.equal(ad.Status.Resolved)expect(d._values[1]).to.equal'ok'end)it('should reject if threshold is exceeded',function()local c=ad.retry(function()return ad.reject'fail'end,5)expect(c:getStatus()).to.equal(ad.Status.Rejected)expect(c._values[1]).to.equal'fail'end)end)describe('Promise.retryWithDelay',function()it('should retry after a delay',function()local c=0 local d=ad.retryWithDelay(function(d)expect(d).to.equal'foo'c=c+1 if c==3 then return ad.resolve'ok'end return ad.reject'fail'end,3,10,'foo')expect(c).to.equal(1)af(11)expect(c).to.equal(2)af(11)expect(c).to.equal(3)expect(d:getStatus()).to.equal(ad.Status.Resolved)expect(d._values[1]).to.equal'ok'end)end)describe('Promise.fromEvent',function()it('should convert a Promise into an event',function()local c=Instance.new'BindableEvent'local d=ad.fromEvent(c.Event)expect(d:getStatus()).to.equal(ad.Status.Started)c:Fire'foo'expect(d:getStatus()).to.equal(ad.Status.Resolved)expect(d._values[1]).to.equal'foo'end)it('should convert a Promise into an event with the predicate',function()local c=Instance.new'BindableEvent'local d=ad.fromEvent(c.Event,function(d)return d=='foo'end)expect(d:getStatus()).to.equal(ad.Status.Started)c:Fire'bar'expect(d:getStatus()).to.equal(ad.Status.Started)c:Fire'foo'expect(d:getStatus()).to.equal(ad.Status.Resolved)expect(d._values[1]).to.equal'foo'end)end)describe('Promise.is',function()it('should work with current version',function()local c=ad.resolve(1)expect(ad.is(c)).to.equal(true)end)it('should work with any object with an andThen',function()local c={andThen=function()return 1 end}expect(ad.is(c)).to.equal(true)end)it('should work with older promises',function()local c={}c.prototype={}c.__index=c.prototype function c.prototype:andThen()end local d=setmetatable({},c)expect(ad.is(d)).to.equal(true)end)end)end end)()end,[98]=function()local aa,ab,ac=a(98)return(function(...)return ac(ab.Parent.Parent['evaera_promise@4.0.0']['promise'])end)()end,[99]=function()local aa,ab,ac=a(99)return(function(...)ac(ab.types)return{createMotion=ac(ab.createMotion),config=ac(ab.config),immediate=ac(ab.solvers.immediate),linear=ac(ab.solvers.linear),spring=ac(ab.solvers.spring),tween=ac(ab.solvers.tween)}end)()end,[100]=function()a(100)return(function(...)local aa={spring={default={tension=170,friction=26},gentle={tension=120,friction=14},wobbly={tension=180,friction=12},stiff={tension=210,friction=20},slow={tension=280,friction=60},molasses={tension=280,friction=120}},linear={default={speed=1}},tween={default={time=1,style=Enum.EasingStyle.Quad,direction=Enum.EasingDirection.Out,repeatCount=0,reverses=false,delayTime=0}}}return aa end)()end,[101]=function()local aa,ab,ac=a(101)return(function(...)local ad,ae,af,ag,c,d,e,f,g=game:GetService'RunService',ac(ab.Parent.types),ac(ab.Parent.solvers.immediate),ac(ab.Parent.solvers.linear),ac(ab.Parent.solvers.spring),ac(ab.Parent.solvers.tween),ac(ab.Parent.utils.intermediate),ac(ab.Parent.utils.assign),ac(ab.Parent.utils.merge)local h={heartbeat=ad.Heartbeat,start=false}local function i(j,k)local l,m,n,o,p,q,r,s,t,u=g(h,k or{}),typeof(j),{},{},{},{},1,false for v,w in e.to(j)do n[v]={value=w,complete=true}end local function v()if t then t:Disconnect()t=nil end end local function w(x)if t then return v end t=l.heartbeat:Connect(function(y)x:step(y)end)return v end local function x()local y={}for z,A in n do y[z]=A.value end return e.from(y,m)end local function y()local z={}for A,B in n do z[A]=B.velocity or 0 end return e.from(z,m)end local function z(A,B)local C=e.to(B)for D,E in n do local F=C[D]if F then E.value=F E.complete=false end end end local function A(B,C)for D,E in n do local F=C[D]if F then E.complete=false f(E,F)end end end local function B(C,D)if type(D)=='number'then for E,F in n do if not F.velocity then continue end F.complete=false F.velocity+=D end return end local E=e.to(D)for F,G in E do local H=n[F]if not H or not H.velocity then continue end H.complete=false H.velocity+=G end end local function C(D,E)local F=e.to(E)for G,H in F do local I=n[G]if not I or not I.velocity then continue end I.complete=false I.velocity=H end end local function D(E,F)if type(F)=='function'then for G,H in n do if H.destructor then H.destructor()H.destructor=nil end H.complete=false if F(G,H,0)~=false then o[G]=F end end return end for G,H in F do local I=n[G]if not I then continue end if I.destructor then I.destructor()I.destructor=nil end I.complete=false if H(G,I,0)~=false then o[G]=H end end end local function E(F,G)F:to(af(G))end local function F(G,H,I)G:to(ag(H,I))end local function G(H,I,J)H:to(c(I,J))end local function H(I,J,K)I:to(d(J,K))end local function I(J,K)for L,M in o do local N=n[L]if N and not N.complete then M(L,N,K)end end local L,M=J:get(),J:isComplete()if not M or not s or u~=L then for N,O in p do task.spawn(O,L,K)end end if M and(not s or u~=L)then for N,O in q do task.spawn(O,L)end end s=M u=L return L end local function J()for K,L in n do if not L.complete then return false end end return true end local function K(L,M)local N=r r+=1 q[N]=M return function()q[N]=nil end end local function L(M,N)local O=r r+=1 p[O]=N return function()p[O]=nil end end local function M()s=false r=1 v()table.clear(p)table.clear(q)table.clear(o)for N,O in n do if O.destructor then O.destructor()O.destructor=nil end end end local N={state=n,start=w,stop=v,get=x,set=z,getVelocity=y,setVelocity=C,impulse=B,patch=A,to=D,immediate=E,linear=F,spring=G,tween=H,step=I,isComplete=J,onComplete=K,onStep=L,destroy=M}if l.start then N:start()end return N end return i end)()end,[102]=function()local aa,ab,ac=a(102)return(function(...)return function()local ad,ae,af,ag=ac(ab.Parent.types),ac(ab.Parent.createMotion),ac(ab.Parent.solvers.linear),ac(ab.Parent.utils.spy)it('should return a Motion',function()local c=ae(0)expect(c).to.be.ok()expect(c.state).to.be.a'table'expect(c.start).to.be.a'function'expect(c.stop).to.be.a'function'expect(c.get).to.be.a'function'expect(c.set).to.be.a'function'expect(c.getVelocity).to.be.a'function'expect(c.setVelocity).to.be.a'function'expect(c.patch).to.be.a'function'expect(c.impulse).to.be.a'function'expect(c.to).to.be.a'function'expect(c.step).to.be.a'function'expect(c.isComplete).to.be.a'function'expect(c.onComplete).to.be.a'function'expect(c.onStep).to.be.a'function'expect(c.destroy).to.be.a'function'end)it('should animate a number',function()local c=ae(0)c:to(af(1,{speed=1}))c:step(0.5)expect(c:get()).to.equal(0.5)expect(c:isComplete()).to.equal(false)c:step(0.5)expect(c:get()).to.equal(1)expect(c:isComplete()).to.equal(true)end)it('should animate a vector',function()local c=ae(Vector3.new())c:to(af(Vector3.new(0.5,0.75,1),{speed=1}))c:step(0.5)expect(c:get()).to.equal(Vector3.new(0.5,0.5,0.5))expect(c:isComplete()).to.equal(false)c:step(0.5)expect(c:get()).to.equal(Vector3.new(0.5,0.75,1))expect(c:isComplete()).to.equal(true)end)it('should animate an array',function()local c=ae{0,0,0}c:to(af({0.5,0.75,1},{speed=1}))c:step(0.5)expect(c:get()[1]).to.equal(0.5)expect(c:get()[2]).to.equal(0.5)expect(c:get()[3]).to.equal(0.5)c:step(0.5)expect(c:get()[1]).to.equal(0.5)expect(c:get()[2]).to.equal(0.75)expect(c:get()[3]).to.equal(1)end)describe("when calling 'step'",function()it('should call onStep',function()local c,d=ae(0),ag()c:onStep(d.handle)c:to(af(1,{speed=1}))c:step(0.5)expect(d.calls).to.equal(1)expect(d.arguments[1][1]).to.equal(0.5)expect(d.arguments[1][2]).to.equal(0.5)c:step(0.5)expect(d.calls).to.equal(2)expect(d.arguments[2][1]).to.equal(1)expect(d.arguments[2][2]).to.equal(0.5)c:step(0.5)expect(d.calls).to.equal(2)c:to(af(0,{speed=1}))c:step(0.5)expect(d.calls).to.equal(3)expect(d.arguments[3][1]).to.equal(0.5)expect(d.arguments[3][2]).to.equal(0.5)end)it('should call onComplete',function()local c,d=ae(0),ag()c:onComplete(d.handle)c:to(af(1,{speed=1}))c:step(0.5)expect(d.calls).to.equal(0)c:step(0.5)expect(d.calls).to.equal(1)expect(d.arguments[1][1]).to.equal(1)c:step(0.5)expect(d.calls).to.equal(1)c:to(af(0,{speed=1}))c:step(1)expect(d.calls).to.equal(2)expect(d.arguments[2][1]).to.equal(0)end)it('should not run completed solvers',function()local c,d,e=ae{a=0,b=0},ag(),ag()c:to{a=d.handle,b=function(f,g,h)e.handle(f,g,h)g.value=1 g.complete=true end}expect(c.state.a.complete).to.equal(false)expect(c.state.b.complete).to.equal(true)expect(d.calls).to.equal(1)expect(e.calls).to.equal(1)c:step(1)expect(c.state.a.complete).to.equal(false)expect(c.state.b.complete).to.equal(true)expect(d.calls).to.equal(2)expect(e.calls).to.equal(1)end)end)describe("when calling 'to'",function()it('should destroy the old solver',function()local c,d=ae(0),ag()c:to(function(e,f)f.destructor=d.handle end)c:step(1)expect(d.calls).to.equal(0)c:to(af(1))expect(d.calls).to.equal(1)end)it('should accept solvers per key',function()local c=ae{a=0,b=0}c:to{a=af(1,{speed=1}),b=af(1,{speed=0.5})}c:step(0.5)expect(c:get().a).to.equal(0.5)expect(c:get().b).to.equal(0.25)expect(c:isComplete()).to.equal(false)c:step(0.5)expect(c:get().a).to.equal(1)expect(c:get().b).to.equal(0.5)expect(c:isComplete()).to.equal(false)c:step(1)expect(c:get().a).to.equal(1)expect(c:get().b).to.equal(1)expect(c:isComplete()).to.equal(true)end)it('should mount the solver',function()local c,d=ae(0),ag()c:to(d.handle)expect(d.calls).to.equal(1)expect(d.arguments[1][1]).to.equal(1)expect(d.arguments[1][2]).to.be.a'table'expect(d.arguments[1][3]).to.equal(0)end)it('should accept complex solvers',function()local c=ae{a=0,b=0}c:to(af({a=1},{speed=1}))c:to(af({b=1},{speed=1}))c:step(0.5)expect(c:get().a).to.equal(0.5)expect(c:get().b).to.equal(0.5)expect(c:isComplete()).to.equal(false)c:step(0.5)expect(c:get().a).to.equal(1)expect(c:get().b).to.equal(1)expect(c:isComplete()).to.equal(true)end)end)describe('when passing options',function()it('should accept heartbeat',function()local c,d={}local function e(f,g)table.insert(c,g)local function h()table.remove(c,table.find(c,g)or-1)end return{Disconnect=h}end local function f(g)for h,i in c do i(g)end end d={Connect=e}local g=ae(0,{heartbeat=d,start=true})g:to(af(1,{speed=1}))f(0.5)expect(g:get()).to.equal(0.5)expect(g:isComplete()).to.equal(false)f(0.5)expect(g:get()).to.equal(1)expect(g:isComplete()).to.equal(true)end)end)describe('patching state',function()it('should set a value',function()local c=ae{a=0,b=0}c:to{a=af(1,{speed=1}),b=af(1,{speed=0.5})}c:step(0.5)expect(c:get().a).to.equal(0.5)expect(c:get().b).to.equal(0.25)c:set{a=2}c:step(0.5)expect(c:get().a).to.equal(1.5)expect(c:get().b).to.equal(0.5)end)it('should flag as incomplete',function()local c=ae{a=0,b=0}c:to{a=af(1,{speed=1}),b=af(1,{speed=1})}c:step(1)expect(c:isComplete()).to.equal(true)c:set{a=2}expect(c:isComplete()).to.equal(false)c:step(1)expect(c:isComplete()).to.equal(true)end)it('should patch the state',function()local c=ae{a=0,b=0}c:patch{a={value=1}}expect(c:get().a).to.equal(1)expect(c:get().b).to.equal(0)end)end)end end)()end,[104]=function()local aa,ab,ac=a(104)return(function(...)local ad,ae=ac(ab.Parent.Parent.types),ac(ab.Parent.Parent.utils.intermediate)local function af(ag)local c=ae.to(ag)return function(d,e)local f=ae.index(c,d)if not f then return false end e.value=f e.complete=true end end return af end)()end,[105]=function()local aa,ab,ac=a(105)return(function(...)return function()local ad,ae=ac(ab.Parent.Parent.createMotion),ac(ab.Parent.immediate)it('should set a value',function()local af=ad{x=0,y=0}af:to(ae{x=1,y=1})af:step(1)expect(af:get()).to.be.ok()expect(af:get().x).to.equal(1)expect(af:get().y).to.equal(1)expect(af:isComplete()).to.equal(true)end)it('should set multiple values',function()local af=ad{x=0,y=0}af:to{x=ae(1),y=ae(1)}af:step(1)expect(af:get()).to.be.ok()expect(af:get().x).to.equal(1)expect(af:get().y).to.equal(1)expect(af:isComplete()).to.equal(true)af:to{x=ae(2),y=ae(2)}af:step(1)expect(af:get()).to.be.ok()expect(af:get().x).to.equal(2)expect(af:get().y).to.equal(2)expect(af:isComplete()).to.equal(true)end)it('should wake spring after last completion',function()local af=ad(0)af:linear(1,{speed=1})af:step(1)expect(af:isComplete()).to.equal(true)local ag,c=0,0 af:onStep(function()ag+=1 end)af:onComplete(function()c+=1 end)af:immediate(0)af:step(1)expect(af:isComplete()).to.equal(true)expect(ag).to.equal(1)expect(c).to.equal(1)af:step(1)expect(ag).to.equal(1)expect(c).to.equal(1)end)it('should trigger events',function()local af,ag,c=ad(0),0,0 af:onStep(function()ag+=1 end)af:onComplete(function()c+=1 end)af:immediate(0)af:step(1)expect(af:isComplete()).to.equal(true)expect(ag).to.equal(1)expect(c).to.equal(1)af:step(1)expect(ag).to.equal(1)expect(c).to.equal(1)end)end end)()end,[106]=function()local aa,ab,ac=a(106)return(function(...)local ad,ae,af=ac(ab.Parent.Parent.types),ac(ab.Parent.Parent.config),ac(ab.Parent.Parent.utils.intermediate)local function ag(c)local d=(type(c)=='table'and{(c.speed)}or{c})[1]return{speed=d or ae.linear.default.speed}end local function c(d,e)local f,g=ag(e),af.to(d)return function(h,i,j)local k=af.index(g,h)if not k then return false end local l=f.speed*j*math.sign(k-i.value)if math.abs(l)>=math.abs(k-i.value)then i.complete=true i.value=k i.velocity=0 else i.value+=l i.velocity=l end end end return c end)()end,[107]=function()local aa,ab,ac=a(107)return(function(...)return function()local ad,ae=ac(ab.Parent.Parent.createMotion),ac(ab.Parent.linear)it('should animate a value',function()local af=ad(0)af:to(ae(1,{speed=1}))af:step(0.5)expect(af:get()).to.equal(0.5)expect(af:isComplete()).to.equal(false)af:step(0.5)expect(af:get()).to.equal(1)expect(af:isComplete()).to.equal(true)end)it('should animate multiple values',function()local af=ad{x=0,y=0}af:to(ae({x=1,y=1},{speed=1}))af:step(0.5)expect(af:get()).to.be.ok()expect(af:get().x).to.equal(0.5)expect(af:get().y).to.equal(0.5)expect(af:isComplete()).to.equal(false)af:step(0.5)expect(af:get()).to.be.ok()expect(af:get().x).to.equal(1)expect(af:get().y).to.equal(1)expect(af:isComplete()).to.equal(true)af:to{x=ae(2,{speed=1}),y=ae(2,{speed=0.5})}af:step(0.5)expect(af:get()).to.be.ok()expect(af:get().x).to.equal(1.5)expect(af:get().y).to.equal(1.25)expect(af:isComplete()).to.equal(false)af:step(0.5)expect(af:get()).to.be.ok()expect(af:get().x).to.equal(2)expect(af:get().y).to.equal(1.5)expect(af:isComplete()).to.equal(false)af:step(1)expect(af:get()).to.be.ok()expect(af:get().x).to.equal(2)expect(af:get().y).to.equal(2)expect(af:isComplete()).to.equal(true)end)it('should complete if overshooting',function()local af=ad(0)af:to(ae(1,{speed=1}))af:step(1000)expect(af:get()).to.equal(1)expect(af:isComplete()).to.equal(true)end)end end)()end,[108]=function()local aa,ab,ac=a(108)return(function(...)local ad,ae,af,ag,c=ac(ab.Parent.Parent.types),ac(ab.Parent.Parent.config),ac(ab.Parent.Parent.utils.intermediate),1,100 local function d(e)local f,g,h=e.mass or 1,e.tension or ae.spring.default.tension,e.friction or ae.spring.default.friction if e.frequency or e.damping then local i,j=e.frequency or 0.5,e.damping or 1 g=(2*math.pi/i)^2*f h=(4*math.pi*j*f)/i end return{mass=f,tension=g,friction=h,position=e.position,velocity=e.velocity,impulse=e.impulse,restingVelocity=e.restingVelocity or 0.001,restingPosition=e.restingPosition or 0.0001}end local function e(f,g)local h,i,j=d(g or{}),af.to(f),true return function(k,l,m)local n=af.index(i,k)if not n then return false end if j then j=false l.value=(h.position or l.value or 0)l.velocity=(h.velocity or l.velocity or 0)+(h.impulse or 0)end local o,p,q=l.value,l.velocity or 0,math.min(math.ceil((m*1000)/ag),c)for r=1,q do local s,t=-h.tension*0.000001*(o-n),-h.friction*0.001*p local u=(s+t)/h.mass p+=u*ag o+=p*ag end if math.abs(p)<h.restingVelocity and math.abs(o-n)<h.restingPosition then l.complete=true l.value=n l.velocity=0 else l.value=o l.velocity=p end end end return e end)()end,[109]=function()local aa,ab,ac=a(109)return(function(...)return function()local ad,ae,af,ag=ac(ab.Parent.Parent.createMotion),ac(ab.Parent.Parent.utils.snapshot),ac(ab.Parent.spring),{default='[0.37,0.73,0.9,0.96,0.98,0.99,0.99,0.99,0.99,1]',underdamped='[0.41,0.84,1.01,1.03,1.02,1.01,0.99,0.99,0.99,1]',critical='[0.36,0.71,0.89,0.95,0.98,0.99,0.99,0.99,0.99,1]',overdamped=[=[[0.31,0.6,0.78,0.87,0.93,0.96,0.97,0.98,0.99,0.99,0.99,0.99,0.99,0.99,0.99,0.99]]=],tension_200='[0.43,0.81,0.95,0.99,0.99,1.01,1.01,1]',tension_300='[0.61,0.98,1.03,1.01,0.99,0.99,1]',mass_half=[=[[0.44,0.74,0.87,0.94,0.97,0.98,0.99,0.99,0.99,0.99,0.99,0.99,1]]=],mass_2=[=[[0.27,0.67,0.92,1.03,1.05,1.03,1.02,1.01,0.99,0.99,0.99,0.99,1]]=],friction_20='[0.43,0.85,1.01,1.03,1.01,1.01,0.99,0.99,0.99,1]',friction_30=[=[[0.35,0.67,0.84,0.92,0.96,0.98,0.99,0.99,0.99,0.99,0.99,0.99,1]]=]}it('should animate a value',function()local c=ae.testSnapshot(af(1),ag.default)expect(c:get()).to.equal(1)expect(c:isComplete()).to.equal(true)end)it('should accept damping ratio',function()local c c=ae.testSnapshot(af(1,{damping=0.75}),ag.underdamped)expect(c:isComplete()).to.equal(true)c=ae.testSnapshot(af(1,{damping=1}),ag.critical)expect(c:isComplete()).to.equal(true)c=ae.testSnapshot(af(1,{damping=1.3}),ag.overdamped)expect(c:isComplete()).to.equal(false)end)it('should accept tension',function()local c c=ae.testSnapshot(af(1,{tension=200}),ag.tension_200)expect(c:isComplete()).to.equal(true)c=ae.testSnapshot(af(1,{tension=300}),ag.tension_300)expect(c:isComplete()).to.equal(true)end)it('should accept mass',function()local c c=ae.testSnapshot(af(1,{mass=0.5}),ag.mass_half)expect(c:isComplete()).to.equal(true)c=ae.testSnapshot(af(1,{mass=2}),ag.mass_2)expect(c:isComplete()).to.equal(true)end)it('should accept friction',function()local c c=ae.testSnapshot(af(1,{friction=20}),ag.friction_20)expect(c:isComplete()).to.equal(true)c=ae.testSnapshot(af(1,{friction=30}),ag.friction_30)expect(c:isComplete()).to.equal(true)end)describe('when passed initial values',function()it('should accept position',function()local c=ad(0)c:to(af(1,{position=0.5}))expect(c:get()).to.equal(0.5)end)it('should accept velocity',function()local c=ad(0)c:to(af(1,{velocity=1000}))expect(c.state[1].velocity).to.equal(1000)c:step(0.1)expect(c:get()>1).to.equal(true)end)it('should apply impulse',function()local c=ad(0)c:to(af(1,{impulse=1}))c:to(af(1,{impulse=1}))expect(c.state[1].velocity).to.equal(2)end)end)end end)()end,[110]=function()local aa,ab,ac=a(110)return(function(...)local ad,ae,af,ag,c=game:GetService'TweenService',ac(ab.Parent.Parent.types),ac(ab.Parent.Parent.config),ac(ab.Parent.Parent.utils.intermediate),ac(ab.Parent.Parent.utils.merge)local function d(e,f,g)local h,i=TweenInfo.new(g.time,g.style,g.direction,g.repeatCount,g.reverses,g.delayTime),Instance.new'NumberValue'local j=ad:Create(i,h,{Value=f})i.Value=e return{value=i,tween=j,complete=false}end local function e(f,g)local h,i,j=c(af.tween.default,g or{}),ag.to(f),{}return function(k,l)local m=ag.index(i,k)if not m then return false end if not l.destructor then local n=d(l.value,m,h)j[k]=n n.tween.Completed:Connect(function()n.complete=true n.value:Destroy()n.tween:Destroy()end)n.tween:Play()function l.destructor()n.tween:Destroy()n.value:Destroy()j[k]=nil end end local n=j[k]if not n then l.complete=true elseif n.complete then l.complete=true l.value=m else l.value=n.value.Value end end end return e end)()end,[111]=function()local aa,ab,ac=a(111)return(function(...)return function()local ad,ae=ac(ab.Parent.Parent.createMotion),ac(ab.Parent.tween)it('should animate a value',function()local af=ad(0)af:to(ae(1,{time=0.01}))af:step(0)expect(af:get()).to.equal(0)task.wait(0.05)af:step(0)expect(af:get()).to.equal(1)end)it('should animate multiple values',function()local af=ad{x=0,y=0}af:to(ae({x=1,y=2},{time=0.01}))af:step(0)expect(af:get()).to.be.ok()expect(af:get().x).to.equal(0)expect(af:get().y).to.equal(0)task.wait(0.05)af:step(0)expect(af:get()).to.be.ok()expect(af:get().x).to.equal(1)expect(af:get().y).to.equal(2)af:to{x=ae(2,{time=0.01}),y=ae(3,{time=0.1})}af:step(0)expect(af:get()).to.be.ok()expect(af:get().x).to.equal(1)expect(af:get().y).to.equal(2)task.wait(0.05)af:step(0)expect(af:get()).to.be.ok()expect(af:get().x).to.equal(2)expect(af:get().y).to.never.equal(3)task.wait(0.05)af:step(0)expect(af:get()).to.be.ok()expect(af:get().x).to.equal(2)expect(af:get().y).to.equal(3)end)end end)()end,[112]=function()a(112)return(function(...)return nil end)()end,[114]=function()a(114)return(function(...)local function aa(ab,...)assert(type(ab)=='table',`Expected a table for first argument, got ${type(ab)}`)for ac=1,select('#',...)do local ad=select(ac,...)for ae,af in ad do ab[ae]=af end end return ab end return aa end)()end,[115]=function()a(115)return(function(...)local aa={number={to=function(aa)return{aa}end,from=function(aa)return aa[1]end},table={to=function(aa)return aa end,from=function(aa)return aa end},UDim2={to=function(aa)return{aa.X.Scale,aa.X.Offset,aa.Y.Scale,aa.Y.Offset}end,from=function(aa)return UDim2.new(aa[1],math.round(aa[2]),aa[3],math.round(aa[4]))end},UDim={to=function(aa)return{aa.Scale,aa.Offset}end,from=function(aa)return UDim.new(aa[1],math.round(aa[2]))end},Vector2={to=function(aa)return{aa.X,aa.Y}end,from=function(aa)return Vector2.new(table.unpack(aa,1,2))end},Vector3={to=function(aa)return{aa.X,aa.Y,aa.Z}end,from=function(aa)return Vector3.new(table.unpack(aa,1,3))end},Color3={to=function(aa)return{aa.R,aa.G,aa.B}end,from=function(aa)return Color3.new(math.clamp(aa[1],0,1),math.clamp(aa[2],0,1),math.clamp(aa[3],0,1))end},CFrame={to=function(aa)return{aa:GetComponents()}end,from=function(aa)return CFrame.new(table.unpack(aa))end}}local function ab(ac)local ad=typeof(ac)if aa[ad]then return aa[ad].to(ac)else error(`Ripple received an unsupported value '{ac}' of type '{ad}'`)end end local function ac(ad,ae)if aa[ae]then return aa[ae].from(ad)else error(`Ripple received an unsupported value '{ad}' of type '{ae}'`)end end local function ad(ae,af)return ae[af]or ae[1]end return{to=ab,from=ac,index=ad}end)()end,[116]=function()a(116)return(function(...)local function aa(ab,ac)local ad=table.clone(ab)for ae,af in pairs(ac)do ad[ae]=af end return ad end return aa end)()end,[117]=function()local aa,ab,ac=a(117)return(function(...)local ad,ae,af,ag,c=game:GetService'HttpService',ac(ab.Parent.Parent.types),ac(ab.Parent.Parent.createMotion),0.1,20 local function d(e,f)local g,h={},af(0)h:to(e)for i=1,f or c do local j=h:step(ag)j=(j<1 and{(math.floor(j*100)/100)}or{((j>1 and{(math.ceil(j*100)/100)}or{j})[1])})[1]table.insert(g,j)if j==1 then break end end return ad:JSONEncode(g),h end local function e(f,g)local h=select(2,string.gsub(g,',',','))+1 local i,j=d(f,h)if i~=g then error(`Snapshot does not match expected value.\n\nExpected:\n{g}\n\nActual:\n{i}`,2)end return j end return{createSnapshot=d,testSnapshot=e}end)()end,[118]=function()a(118)return(function(...)local function aa()local ab local function ac(...)ab.calls+=1 ab.arguments[ab.calls]={...}end ab={calls=0,arguments={},handle=ac}return ab end return aa end)()end,[120]=function()local aa,ab,ac=a(120)return(function(...)local ad do ad=false local ae,af=Instance.new'BindableEvent',false ae.Event:Connect(function()af=true end)ae:Fire()ae:Destroy()if af==false then ad=true end end local ae=ad and ac(ab.Deferred)or ac(ab.Immediate)return ae end)()end,[121]=function()a(121)return(function(...)local aa={}aa.__index=aa local ab={}ab.__index=ab function aa.new()return setmetatable({_active=true,_head=nil},aa)end function aa.Is(ac)return typeof(ac)=='table'and getmetatable(ac)==aa end function aa:IsActive()return self._active==true end function aa:Connect(ac)assert(typeof(ac)=='function','Must be function')if self._active~=true then return setmetatable({Connected=false,_node=nil},ab)end local ad=self._head local ae={_signal=self,_connection=nil,_handler=ac,_next=ad,_prev=nil}if ad~=nil then ad._prev=ae end self._head=ae local af=setmetatable({Connected=true,_node=ae},ab)ae._connection=af return af end function aa:Once(ac)assert(typeof(ac)=='function','Must be function')local ad ad=self:Connect(function(...)if ad==nil then return end ad:Disconnect()ad=nil ac(...)end)return ad end aa.ConnectOnce=aa.Once function aa:Wait()local ac do ac=coroutine.running()local ad ad=self:Connect(function(...)if ad==nil then return end ad:Disconnect()ad=nil if coroutine.status(ac)=='suspended'then task.spawn(ac,...)end end)end return coroutine.yield()end function aa:Fire(...)local ac=self._head while ac~=nil do task.defer(ac._handler,...)ac=ac._next end end function aa:DisconnectAll()local ac=self._head while ac~=nil do local ad=ac._connection if ad~=nil then ad.Connected=false ad._node=nil ac._connection=nil end ac=ac._next end self._head=nil end function aa:Destroy()if self._active~=true then return end self:DisconnectAll()self._active=false end function ab:Disconnect()if self.Connected~=true then return end self.Connected=false local ac=self._node local ad,ae=ac._prev,ac._next if ae~=nil then ae._prev=ad end if ad~=nil then ad._next=ae else ac._signal._head=ae end ac._connection=nil self._node=nil end ab.Destroy=ab.Disconnect return aa end)()end,[122]=function()a(122)return(function(...)do error'This is not supposed to run!'end local aa={}aa.__index=aa local ab={}ab.__index=ab function aa.new()return{}end function aa.Is(ac)return true end function aa:IsActive()return true end function aa:Connect(ac)end function aa:Once(ac)end function aa:Wait()end function aa:Fire(...)end function aa:DisconnectAll()end function aa:Destroy()end function ab:Disconnect()end local ac={}function ac.new()return aa.new()end function ac.Is(ad)return true end return ac end)()end,[123]=function()local aa,ab,ac=a(123)return(function(...)local ad,ae=ac(ab.Parent.Deferred),{}do for af,ag in pairs(ad)do ae[af]=ag end ae.__index=ae end local af local function ag(c,...)local d=af af=nil c(...)af=d end local function c()af=coroutine.running()while true do ag(coroutine.yield())end end function ae.new()return setmetatable({_active=true,_head=nil},ae)end function ae.Is(d)return typeof(d)=='table'and getmetatable(d)==ae end function ae:Fire(...)local d=self._head while d~=nil do if d._connection~=nil then if af==nil then task.spawn(c)end task.spawn(af,d._handler,...)end d=d._next end end return ae end)()end,[124]=function()a(124)return(function(...)return error'Not meant to run.'end)()end,[125]=function()a(125)return(function(...)return{package={authors={'RBLXUtils','LucasMZReal'},description=[[FastSignal is a signal library made with consistency and expectable behaviour in mind, it is efficient, easy to use, and widely compatible.]],license='MIT',name='lucasmzreal/fastsignal',realm='shared',registry='https://github.com/UpliftGames/wally-index',version='10.4.0'}}end)()end,[127]=function()local aa,ab,ac=a(127)return(function(...)local ad={SingleMotor=ac(ab.SingleMotor),GroupMotor=ac(ab.GroupMotor),Instant=ac(ab.Instant),Linear=ac(ab.Linear),Spring=ac(ab.Spring),isMotor=ac(ab.isMotor)}return ad end)()end,[128]=function()local aa,ab,ac=a(128)return(function(...)local ad,ae,af,ag=game:GetService'RunService',ac(ab.Parent.Signal),function()end,{}ag.__index=ag function ag.new()return setmetatable({_onStep=ae.new(),_onStart=ae.new(),_onComplete=ae.new()},ag)end function ag:onStep(c)return self._onStep:connect(c)end function ag:onStart(c)return self._onStart:connect(c)end function ag:onComplete(c)return self._onComplete:connect(c)end function ag:start()if not self._connection then self._connection=ad.RenderStepped:Connect(function(c)self:step(c)end)end end function ag:stop()if self._connection then self._connection:Disconnect()self._connection=nil end end ag.destroy=ag.stop ag.step=af ag.getValue=af ag.setGoal=af function ag:__tostring()return'Motor'end return ag end)()end,[129]=function()local aa,ab,ac=a(129)return(function(...)return function()local ad,ae=game:GetService'RunService',ac(ab.Parent.BaseMotor)describe('connection management',function()local af=ae.new()it('should hook up connections on :start()',function()af:start()expect(typeof(af._connection)).to.equal'RBXScriptConnection'end)it('should remove connections on :stop() or :destroy()',function()af:stop()expect(af._connection).to.equal(nil)end)end)it('should call :step() with deltaTime',function()local af,ag=(ae.new())function af:step(...)ag={...}af:stop()end af:start()local c=ad.RenderStepped:Wait()ad.RenderStepped:Wait()expect(ag).to.be.ok()expect(ag[1]).to.equal(c)end)end end)()end,[130]=function()local aa,ab,ac=a(130)return(function(...)local ad,ae,af=ac(ab.Parent.BaseMotor),ac(ab.Parent.SingleMotor),ac(ab.Parent.isMotor)local ag=setmetatable({},ad)ag.__index=ag local function c(d)if af(d)then return d end local e=typeof(d)if e=='number'then return ae.new(d,false)elseif e=='table'then return ag.new(d,false)end error(('Unable to convert %q to motor; type %s is unsupported'):format(d,e),2)end function ag.new(d,e)assert(d,'Missing argument #1: initialValues')assert(typeof(d)=='table','initialValues must be a table!')assert(not d.step,[[initialValues contains disallowed property "step". Did you mean to put a table of values here?]])local f=setmetatable(ad.new(),ag)if e~=nil then f._useImplicitConnections=e else f._useImplicitConnections=true end f._complete=true f._motors={}for g,h in pairs(d)do f._motors[g]=c(h)end return f end function ag:step(d)if self._complete then return true end local e=true for f,g in pairs(self._motors)do local h=g:step(d)if not h then e=false end end self._onStep:fire(self:getValue())if e then if self._useImplicitConnections then self:stop()end self._complete=true self._onComplete:fire()end return e end function ag:setGoal(d)assert(not d.step,[[goals contains disallowed property "step". Did you mean to put a table of goals here?]])self._complete=false self._onStart:fire()for e,f in pairs(d)do local g=assert(self._motors[e],('Unknown motor for key %s'):format(e))g:setGoal(f)end if self._useImplicitConnections then self:start()end end function ag:getValue()local d={}for e,f in pairs(self._motors)do d[e]=f:getValue()end return d end function ag:__tostring()return'Motor(Group)'end return ag end)()end,[131]=function()local aa,ab,ac=a(131)return(function(...)return function()local ad,ae,af=ac(ab.Parent.GroupMotor),ac(ab.Parent.Instant),ac(ab.Parent.Spring)it('should complete when all child motors are complete',function()local ag=ad.new({A=1,B=2},false)expect(ag._complete).to.equal(true)ag:setGoal{A=ae.new(3),B=af.new(4,{frequency=7.5,dampingRatio=1})}expect(ag._complete).to.equal(false)ag:step(1.6666666666666665E-2)expect(ag._complete).to.equal(false)for c=1,30 do ag:step(1.6666666666666665E-2)end expect(ag._complete).to.equal(true)end)it('should start when the goal is set',function()local ag,c=ad.new({A=0},false),false ag:onStart(function()c=not c end)ag:setGoal{A=ae.new(1)}expect(c).to.equal(true)ag:setGoal{A=ae.new(1)}expect(c).to.equal(false)end)it('should properly return all values',function()local ag=ad.new({A=1,B=2},false)local c=ag:getValue()expect(c.A).to.equal(1)expect(c.B).to.equal(2)end)it('should error when a goal is given to GroupMotor.new',function()local ag=pcall(function()ad.new(ae.new(0))end)expect(ag).to.equal(false)end)it([[should error when a single goal is provided to GroupMotor:step]],function()local ag=pcall(function()ad.new{a=1}:setGoal(ae.new(0))end)expect(ag).to.equal(false)end)end end)()end,[132]=function()a(132)return(function(...)local aa={}aa.__index=aa function aa.new(ab)return setmetatable({_targetValue=ab},aa)end function aa:step()return{complete=true,value=self._targetValue}end return aa end)()end,[133]=function()local aa,ab,ac=a(133)return(function(...)return function()local ad=ac(ab.Parent.Instant)it('should return a completed state with the provided value',function()local ae=ad.new(1.23)local af=ae:step(0.1,{value=0,complete=false})expect(af.complete).to.equal(true)expect(af.value).to.equal(1.23)end)end end)()end,[134]=function()a(134)return(function(...)local aa={}aa.__index=aa function aa.new(ab,ac)assert(ab,'Missing argument #1: targetValue')ac=ac or{}return setmetatable({_targetValue=ab,_velocity=ac.velocity or 1},aa)end function aa:step(ab,ac)local ad,ae,af=ab.value,self._velocity,self._targetValue local ag=ac*ae local c=ag>=math.abs(af-ad)ad=ad+ag*(af>ad and 1 or-1)if c then ad=self._targetValue ae=0 end return{complete=c,value=ad,velocity=ae}end return aa end)()end,[135]=function()local aa,ab,ac=a(135)return(function(...)return function()local ad,ae=ac(ab.Parent.SingleMotor),ac(ab.Parent.Linear)describe('completed state',function()local af,ag=ad.new(0,false),ae.new(1,{velocity=1})af:setGoal(ag)for c=1,60 do af:step(1.6666666666666665E-2)end it('should complete',function()expect(af._state.complete).to.equal(true)end)it('should be exactly the goal value when completed',function()expect(af._state.value).to.equal(1)end)end)describe('uncompleted state',function()local af,ag=ad.new(0,false),ae.new(1,{velocity=1})af:setGoal(ag)for c=1,59 do af:step(1.6666666666666665E-2)end it('should be uncomplete',function()expect(af._state.complete).to.equal(false)end)end)describe('negative velocity',function()local af,ag=ad.new(1,false),ae.new(0,{velocity=1})af:setGoal(ag)for c=1,60 do af:step(1.6666666666666665E-2)end it('should complete',function()expect(af._state.complete).to.equal(true)end)it('should be exactly the goal value when completed',function()expect(af._state.value).to.equal(0)end)end)end end)()end,[136]=function()a(136)return(function(...)local aa={}aa.__index=aa function aa.new(ab,ac)return setmetatable({signal=ab,connected=true,_handler=ac},aa)end function aa:disconnect()if self.connected then self.connected=false for ab,ac in pairs(self.signal._connections)do if ac==self then table.remove(self.signal._connections,ab)return end end end end local ab={}ab.__index=ab function ab.new()return setmetatable({_connections={},_threads={}},ab)end function ab:fire(...)for ac,ad in pairs(self._connections)do ad._handler(...)end for ac,ad in pairs(self._threads)do coroutine.resume(ad,...)end self._threads={}end function ab:connect(ac)local ad=aa.new(self,ac)table.insert(self._connections,ad)return ad end function ab:wait()table.insert(self._threads,coroutine.running())return coroutine.yield()end return ab end)()end,[137]=function()local aa,ab,ac=a(137)return(function(...)return function()local ad=ac(ab.Parent.Signal)it('should invoke all connections, instantly',function()local ae,af,ag=(ad.new())ae:connect(function(c)af=c end)ae:connect(function(c)ag=c end)ae:fire'hello'expect(af).to.equal'hello'expect(ag).to.equal'hello'end)it('should return values when :wait() is called',function()local ae=ad.new()spawn(function()ae:fire(123,'hello')end)local af,ag=ae:wait()expect(af).to.equal(123)expect(ag).to.equal'hello'end)it('should properly handle disconnections',function()local ae,af=ad.new(),false local ag=ae:connect(function()af=true end)ag:disconnect()ae:fire()expect(af).to.equal(false)end)end end)()end,[138]=function()local aa,ab,ac=a(138)return(function(...)local ad=ac(ab.Parent.BaseMotor)local ae=setmetatable({},ad)ae.__index=ae function ae.new(af,ag)assert(af,'Missing argument #1: initialValue')assert(typeof(af)=='number','initialValue must be a number!')local c=setmetatable(ad.new(),ae)if ag~=nil then c._useImplicitConnections=ag else c._useImplicitConnections=true end c._goal=nil c._state={complete=true,value=af}return c end function ae:step(af)if self._state.complete then return true end local ag=self._goal:step(self._state,af)self._state=ag self._onStep:fire(ag.value)if ag.complete then if self._useImplicitConnections then self:stop()end self._onComplete:fire()end return ag.complete end function ae:getValue()return self._state.value end function ae:setGoal(af)self._state.complete=false self._goal=af self._onStart:fire()if self._useImplicitConnections then self:start()end end function ae:__tostring()return'Motor(Single)'end return ae end)()end,[139]=function()local aa,ab,ac=a(139)return(function(...)return function()local ad,ae=ac(ab.Parent.SingleMotor),ac(ab.Parent.Instant)it('should assign new state on step',function()local af=ad.new(0,false)af:setGoal(ae.new(5))af:step(1.6666666666666665E-2)expect(af._state.complete).to.equal(true)expect(af._state.value).to.equal(5)end)it([[should invoke onComplete listeners when the goal is completed]],function()local af,ag=ad.new(0,false),false af:onComplete(function()ag=true end)af:setGoal(ae.new(5))af:step(1.6666666666666665E-2)expect(ag).to.equal(true)end)it('should start when the goal is set',function()local af,ag=ad.new(0,false),false af:onStart(function()ag=not ag end)af:setGoal(ae.new(5))expect(ag).to.equal(true)af:setGoal(ae.new(5))expect(ag).to.equal(false)end)end end)()end,[140]=function()a(140)return(function(...)local aa,ab,ac,ad=0.001,0.001,0.0001,{}ad.__index=ad function ad.new(ae,af)assert(ae,'Missing argument #1: targetValue')af=af or{}return setmetatable({_targetValue=ae,_frequency=af.frequency or 4,_dampingRatio=af.dampingRatio or 1},ad)end function ad:step(ae,af)local ag,c,d,e,f=self._dampingRatio,self._frequency*2*math.pi,self._targetValue,ae.value,ae.velocity or 0 local g,h,i,j=e-d,(math.exp(-ag*c*af))if ag==1 then i=(g*(1+c*af)+f*af)*h+d j=(f*(1-c*af)-g*(c*c*af))*h elseif ag<1 then local k=math.sqrt(1-ag*ag)local l,m,n=math.cos(c*k*af),(math.sin(c*k*af))if k>ac then n=m/k else local o=af*c n=o+((o*o)*(k*k)*(k*k)/20-k*k)*(o*o*o)/6 end local o if c*k>ac then o=m/(c*k)else local p=c*k o=af+((af*af)*(p*p)*(p*p)/20-p*p)*(af*af*af)/6 end i=(g*(l+ag*n)+f*o)*h+d j=(f*(l-n*ag)-g*(n*c))*h else local k=math.sqrt(ag*ag-1)local l,m=-c*(ag-k),-c*(ag+k)local n=(f-g*l)/(2*c*k)local o=g-n local p,q=o*math.exp(l*af),n*math.exp(m*af)i=p+q+d j=p*l+q*m end local k=math.abs(j)<aa and math.abs(i-d)<ab return{complete=k,value=k and d or i,velocity=j}end return ad end)()end,[141]=function()local aa,ab,ac=a(141)return(function(...)return function()local ad,ae=ac(ab.Parent.SingleMotor),ac(ab.Parent.Spring)describe('completed state',function()local af,ag=ad.new(0,false),ae.new(1,{frequency=2,dampingRatio=0.75})af:setGoal(ag)for c=1,100 do af:step(1.6666666666666665E-2)end it('should complete',function()expect(af._state.complete).to.equal(true)end)it('should be exactly the goal value when completed',function()expect(af._state.value).to.equal(1)end)end)it('should inherit velocity',function()local af=ad.new(0,false)af._state={complete=false,value=0,velocity=-5}local ag=ae.new(1,{frequency=2,dampingRatio=1})af:setGoal(ag)af:step(1.6666666666666665E-2)expect(af._state.velocity<0).to.equal(true)end)end end)()end,[142]=function()a(142)return(function(...)local function aa(ab)local ac=tostring(ab):match'^Motor%((.+)%)$'if ac then return true,ac else return false end end return aa end)()end,[143]=function()local aa,ab,ac=a(143)return(function(...)return function()local ad,ae,af=ac(ab.Parent.isMotor),ac(ab.Parent.SingleMotor),ac(ab.Parent.GroupMotor)local ag,c=ae.new(0),af.new{}it('should properly detect motors',function()expect(ad(ag)).to.equal(true)expect(ad(c)).to.equal(true)end)it("shouldn't detect things that aren't motors",function()expect(ad{}).to.equal(false)end)it('should return the proper motor type',function()local d,e=ad(ag)local f,g=ad(c)expect(e).to.equal'Single'expect(g).to.equal'Group'end)end end)()end},{{1,2,{'Fluent Renewed'},{{30,2,{'Themes'},{{53,2,{'GitHub Light Default'}},{55,2,{'GitHub Light'}},{67,2,{'Typewriter'}},{60,2,{'Monokai Vibrant'}},{61,2,{'Monokai'}},{56,2,{'Kimbie Dark'}},{52,2,{'GitHub Light Colorblind'}},{44,2,{'DuoTone Dark Sky'}},{42,2,{'DuoTone Dark Forest'}},{46,2,{'Elementary'}},{88,2,{'Yaru'}},{87,2,{'Yaru Dark'}},{65,2,{'Solarized Light'}},{51,2,{'GitHub Dark'}},{77,2,{'VSC Light+'}},{35,2,{'Amethyst'}},{62,2,{'Quiet Light'}},{64,2,{'Solarized Dark'}},{85,2,{'Viow Neon'}},{70,2,{'VS Dark'}},{81,2,{'Viow Darker'}},{54,2,{'GitHub Light High Contrast'}},{82,2,{'Viow Flat'}},{83,2,{'Viow Light'}},{80,2,{'Viow Arabian'}},{41,2,{'DuoTone Dark Earth'}},{69,2,{'United Ubuntu'}},{50,2,{'GitHub Dark High Contrast'}},{39,2,{'Dark'}},{66,2,{'Tomorrow Night Blue'}},{78,2,{'VSC Red'}},{63,2,{'Rose'}},{57,2,{'Light'}},{74,2,{'VSC Dark+'}},{38,2,{'Dark Typewriter'}},{86,2,{'Vynixu'}},{76,2,{'VSC Light Modern'}},{75,2,{'VSC Light High Contrast'}},{36,2,{'Aqua'}},{48,2,{'GitHub Dark Default'}},{40,2,{'Darker'}},{72,2,{'VSC Dark High Contrast'}},{34,2,{'Amethyst Dark'}},{71,2,{'VS Light'}},{32,2,{'Adapta Nokto'}},{33,2,{'Ambiance'}},{37,2,{'Arc Dark'}},{84,2,{'Viow Mars'}},{79,2,{'Viow Arabian Mix'}},{68,2,{'United GNOME'}},{59,2,{'Monokai Dimmed'}},{43,2,{'DuoTone Dark Sea'}},{31,2,{'Abyss'}},{58,2,{'Monokai Classic'}},{73,2,{'VSC Dark Modern'}},{45,2,{'DuoTone Dark Space'}},{49,2,{'GitHub Dark Dimmed'}},{47,2,{'GitHub Dark Colorblind'}}}},{89,1,{'Packages'},{{92,2,{'Signal'}},{93,1,{'_Index'},{{94,1,{'evaera_promise@4.0.0'},{{95,2,{'promise'},{{96,2,{'init.spec'}}}}}},{119,1,{'lucasmzreal_fastsignal@10.4.0'},{{120,2,{'fastsignal'},{{121,2,{'Deferred'}},{125,2,{'wally'}},{123,2,{'Immediate'}},{122,2,{'Docs'}},{124,2,{'Readme'}}}}}},{126,1,{'reselim_flipper@2.0.0'},{{127,2,{'flipper'},{{129,2,{'BaseMotor.spec'}},{128,2,{'BaseMotor'}},{143,2,{'isMotor.spec'}},{132,2,{'Instant'}},{139,2,{'SingleMotor.spec'}},{130,2,{'GroupMotor'}},{141,2,{'Spring.spec'}},{134,2,{'Linear'}},{131,2,{'GroupMotor.spec'}},{136,2,{'Signal'}},{137,2,{'Signal.spec'}},{135,2,{'Linear.spec'}},{138,2,{'SingleMotor'}},{142,2,{'isMotor'}},{140,2,{'Spring'}},{133,2,{'Instant.spec'}}}}}},{97,1,{'littensy_ripple@0.9.3'},{{98,2,{'Promise'}},{99,2,{'ripple'},{{101,2,{'createMotion'}},{103,1,{'solvers'},{{108,2,{'spring'}},{111,2,{'tween.spec'}},{110,2,{'tween'}},{106,2,{'linear'}},{107,2,{'linear.spec'}},{109,2,{'spring.spec'}},{104,2,{'immediate'}},{105,2,{'immediate.spec'}}}},{113,1,{'utils'},{{117,2,{'snapshot'}},{115,2,{'intermediate'}},{114,2,{'assign'}},{118,2,{'spy'}},{116,2,{'merge'}}}},{112,2,{'types'}},{102,2,{'createMotion.spec'}},{100,2,{'config'}}}}}}}},{90,2,{'Flipper'}},{91,2,{'Ripple'}}}},{13,2,{'Elements'},{{21,2,{'Toggle'}},{18,2,{'Keybind'}},{20,2,{'Slider'}},{14,2,{'Button'}},{19,2,{'Paragraph'}},{15,2,{'Colorpicker'}},{17,2,{'Input'}},{16,2,{'Dropdown'}}}},{22,1,{'Modules'},{{29,2,{'Icons'}},{28,2,{'Creator'}},{23,2,{'Acrylic'},{{26,2,{'CreateAcrylic'}},{25,2,{'AcrylicPaint'}},{27,2,{'Utils'}},{24,2,{'AcrylicBlur'}}}}}},{2,1,{'Components'},{{6,2,{'Element'}},{7,2,{'Notification'}},{4,2,{'Button'}},{3,2,{'Assets'}},{8,2,{'Section'}},{5,2,{'Dialog'}},{10,2,{'Textbox'}},{11,2,{'TitleBar'}},{9,2,{'Tab'}},{12,2,{'Window'}}}}}}},'0.4.1','Fluent Renewed',string,task,setmetatable,error,next,table,unpack,coroutine,script,type,require,pcall,xpcall,tostring,tonumber,_VERSION local r,s,t,u,v,w,x=f.insert,f.remove,f.freeze or function(r)return r end,h.wrap,ae.sub,ae.match,ae.gmatch if p and v(p,1,4)=='Lune'then local y,z=l(k,'@lune/task')if y and z then af=z end end local y=af and af.defer local z,A,B,C,D,E,F,G,H=y or function(z,...)u(z)(...)end,{[1]='Folder',[2]='ModuleScript',[3]='Script',[4]='LocalScript',[5]='StringValue'},{},{},{},{},{},{},{}local I,J={GetFullName={{},function(I)local J,K=I.Name,I.Parent while K do J=K.Name..'.'..J K=K.Parent end return J end},GetChildren={{},function(I)local J={}for K in e,H[I]do r(J,K)end return J end},GetDescendants={{},function(I)local J={}for K in e,H[I]do r(J,K)for L,M in e,K:GetDescendants()do r(J,M)end end return J end},FindFirstChild={{'string','boolean?'},function(I,J,K)local L=H[I]for M in e,L do if M.Name==J then return M end end if K then for M in e,L do return M:FindFirstChild(J,true)end end end},FindFirstAncestor={{'string'},function(I,J)local K=I.Parent while K do if K.Name==J then return K end K=K.Parent end end},WaitForChild={{'string','number?'},function(I,J)return I:FindFirstChild(J)end}},{}for K,L in e,I do local M,N,O=L[1],L[2],{}for P,Q in e,M do local R,S=w(Q,'^([^%?]+)(%??)')O[P]={R,S}end J[K]=function(P,...)if not H[P]then c("Expected ':' not '.' calling member function "..K,2)end local Q={...}for R,S in e,O do local T=Q[R]local U,V,W=j(T),S[1],S[2]if T==nil and not W then c('Argument '..T..' missing or nil',3)end if V~='any'and U~=V and not(U=='nil'and W)then c('Argument '..R..' expects type "'..V..'", got "'..U..'"',2)end end return N(P,...)end end local function K(L,M,N)local O,P=(ag({},{__mode='k'}))local function Q(R)c(R..' is not a valid (virtual) member of '..L..' "'..M..'"',3)end local function R(S)c('Unable to assign (virtual) property '..S..'. Property is read only',3)end local S,T={},{}T.__metatable=false T.__index=function(U,V)if V=='ClassName'then return L elseif V=='Name'then return M elseif V=='Parent'then return N elseif L=='StringValue'and V=='Value'then return P else local W=J[V]if W then return W end end for W in e,O do if W.Name==V then return W end end Q(V)end T.__newindex=function(U,V,W)if V=='ClassName'then R(V)elseif V=='Name'then M=W elseif V=='Parent'then if W==S then return end if N~=nil then H[N][S]=nil end N=W if W~=nil then H[W][S]=true end elseif L=='StringValue'and V=='Value'then P=W else Q(V)end end T.__tostring=function()return M end ag(S,T)H[S]=O if N~=nil then H[N][S]=true end return S end local function L(M,N)local O,P,Q,R=M[1],M[2],M[3],M[4]local S=A[P]local T=Q and s(Q,1)or S local U=K(S,T,N)B[O]=U if Q then for V,W in e,Q do U[V]=W end end if R then for V,W in e,R do L(W,U)end end return U end local M=K('Folder','['..ad..']')for N,O in e,ab do L(O,M)end for N,O in e,aa do local P=B[N]C[P]=O D[P]=N local Q=P.ClassName if Q=='LocalScript'or Q=='Script'then r(F,P)end end local function N(O)local P,Q=O.ClassName,E[O]if Q and P=='ModuleScript'then return g(Q)end local R=C[O]local function S(T)T=n(T)local U,V,W=O:GetFullName(),w(T,'[^:]+:(%d+): (.+)')if not V or not q then return U..':*: '..(W or T)end V=o(V)local X=D[O]local Y=q[X]local Z=V-Y+1 if Z<0 then Z='?'end return U..':'..Z..': '..W end if P=='LocalScript'or P=='Script'then local T,U=m(R,function(T)return debug.traceback(T,2)end)if not T then c(S(U),0)end else local T={m(R,function(T)return debug.traceback(T,2)end)}local U=s(T,1)if not U then local V=s(T,1)c(S(V),0)end E[O]=T return g(T)end end function a(O)local P=B[O]local function Q(R,...)local S={m(R,function(S)return debug.traceback(S,2)end,...)}local T=s(S,1)if not T then c(S[1],3)end return g(S)end local R=t(ag({},{__index=G,__newindex=function(R,S,T)G[S]=T end,__len=function()return#G end,__iter=function()return e,G end}))local S,T=t{version=ac,envname=ad,shared=R,script=i,require=k},P local function U(V,...)local W,X,Y=j(V),'Attempted to call require with a non-ModuleScript','Attempted to call require with self'if W=='table'and H[V]then if V.ClassName~='ModuleScript'then c(X,2)elseif V==P then c(Y,2)end return N(V)elseif W=='string'and v(V,1,1)~='@'then if#V==0 then c('Attempted to call require with empty string',2)end local Z=P if v(V,1,1)=='/'then Z=M elseif v(V,1,2)=='./'then V=v(V,3)end local _ for ah in x(V,'([^/]*)/?')do local ai=ah if ah=='..'then ai='Parent'end if ai~=''then local aj=Z:FindFirstChild(ai)if not aj then local ak=Z.Parent if ak then aj=ak:FindFirstChild(ai)end end if aj then Z=aj elseif ah~=_ and ah~='init'and ah~='init.server'and ah~='init.client'then c('Virtual script path "'..V..'" not found',2)end end _=ah end if Z.ClassName~='ModuleScript'then c(X,2)elseif Z==P then c(Y,2)end return N(Z)end return Q(k,V,...)end return S,T,U end for ah,ai in e,F do z(N,ai)end return N(M:GetChildren()[1])
 end
 local hub={running=true,ready=false,build=report.build,connections={},controls={},runtimeErrors={}}
-local ui,care,ghost,candy,transfer,window
+local ui,care,ghost,candy,transfer,crypt,inventoryAutomation,window
 local function uiContext() if setthreadidentity then pcall(setthreadidentity,8) end end
 local function stopTrace()
     local trace=env.AdoptMeSpyTrace
@@ -6484,6 +7000,8 @@ function hub.stopAll()
     if ghost then safely(function()ghost.setEnabled(false)end) end
     if candy then safely(function()candy.setEnabled(false)end) end
     if transfer then safely(function()transfer.setEnabled(false)end) end
+    if crypt then safely(function()crypt.setEnabled(false)end) end
+    if inventoryAutomation then safely(inventoryAutomation.stopAll)end
     if hub.afk then safely(function()hub.afk.setEnabled(false)end) end
     safely(stopWatch);safely(stopTrace)
 end
@@ -6496,6 +7014,8 @@ local function clean()
     if ghost then safely(ghost.stop) end
     if candy then safely(candy.stop) end
     if transfer then safely(transfer.stop) end
+    if crypt then safely(crypt.stop) end
+    if inventoryAutomation then safely(inventoryAutomation.stop)end
     if hub.afk then safely(hub.afk.stop) end
     for _,connection in ipairs(hub.connections) do pcall(function()connection:Disconnect()end) end
     if env.BulbulComeback==hub then env.BulbulComeback=nil end
@@ -6514,6 +7034,8 @@ end
 function hub.snapshot()
     return {title="bülbül comeback",build=hub.build,ready=hub.ready,care=care and care.snapshot(),transfer=transfer and transfer.snapshot(),
         afk=hub.afk and hub.afk.snapshot(),runtimeErrors=hub.runtimeErrors,
+        crypt=crypt and crypt.snapshot(),
+        inventory=inventoryAutomation and inventoryAutomation.snapshot(),
         ghost=ghost and {enabled=ghost.enabled,status=ghost.status,score=ghost.score,error=ghost.error},
         candy=candy and {enabled=candy.enabled,status=candy.status,confirmed=candy.confirmed,error=candy.error},
         cycle=hub.autoJoin and {enabled=hub.autoJoin.enabled,phase=hub.autoJoin.phase,status=hub.autoJoin.status,
@@ -6546,6 +7068,14 @@ local ok,err=xpcall(function()
         assert(oldCycle.isIdle(),"Önceki Ghost Gallery geçişi sunucu yanıtını bekliyor; yanıt geldikten sonra tekrar yükle.")
     end
     local oldTransfer=env.BulbulComeback and env.BulbulComeback.transfer or env.BulbulBucksActive
+    local oldInventory=env.BulbulInventoryActive
+    if oldInventory then
+        oldInventory.stopAll()
+        local deadline=os.clock()+30
+        while oldInventory.busy and os.clock()<deadline do task.wait(0.1)end
+        assert(not oldInventory.busy,"Önceki anahtar/iksir işlemi henüz bitmedi; yanıt geldikten sonra yeniden yükle.")
+        oldInventory.stop()
+    end
     if oldTransfer then
         oldTransfer.setEnabled(false)
         local deadline=os.clock()+25
@@ -6580,6 +7110,9 @@ local ok,err=xpcall(function()
     transfer=createTransfer(care,hub);hub.transfer=transfer
     candy=env.AdoptMeCandyRain
     ghost=createGhost()
+    crypt=createCrypt(hub);hub.crypt=crypt
+    crypt.setEnabled(previousCrypt)
+    inventoryAutomation=createInventory(care,hub);hub.inventoryAutomation=inventoryAutomation
     if env.BulbulComebackHost==hub then env.BulbulComebackHost=nil end
     hub.care,hub.ghost,hub.candy=care,ghost,candy
     assert(env.BulbulComebackLoad==report,"Bu yükleme daha yeni bir sürümle değiştirildi.")
@@ -6649,7 +7182,7 @@ local ok,err=xpcall(function()
                 (loc and loc.destination_id:find("ManorMinigameInterior",1,true)~=nil),
             timestamp=cycle and cycle.timestamp,queued=m and m.is_queued,inJoinZone=inJoinZone(),
             loading=m and m.minigame_state:get("players_loading"),canInvite=Forced.can_receive_invites()}
-    end,Ready=function() local s=care.snapshot();return not transfer.busy and not s.busy and s.activeCareJobs==0 end,
+    end,Ready=function() local s=care.snapshot();return not transfer.busy and not inventoryAutomation.busy and not s.busy and s.activeCareJobs==0 end,
         Pause=function(reason)cyclePauseReason=reason;transfer.setPaused(reason);care.setPaused(reason);candy.setPaused(reason)end,
         Resume=function()
             transfer.setPaused(nil)
@@ -6815,8 +7348,8 @@ local ok,err=xpcall(function()
         hub.subtabs[id]=group
         return group
     end
-    local eventTabs=subtabs(tabs.halloween,"halloween",{{"locations","Konumlar"},{"ghost","Ghost Gallery"},{"candy","Şeker"}})
-    tabs.ghost=eventTabs.pages.ghost.tab;tabs.candy=eventTabs.pages.candy.tab
+    local eventTabs=subtabs(tabs.halloween,"halloween",{{"locations","Konumlar"},{"ghost","Ghost Gallery"},{"candy","Şeker"},{"crypt","Crypt"}})
+    tabs.ghost=eventTabs.pages.ghost.tab;tabs.candy=eventTabs.pages.candy.tab;tabs.crypt=eventTabs.pages.crypt.tab
     local travelTabs=subtabs(tabs.travel,"travel",{{"care","Bakım"},{"shops","Mağazalar"},{"map","Harita"}})
     local catalog=care.locations()
     local function travelButtons(parent,entries)
@@ -6843,6 +7376,8 @@ local ok,err=xpcall(function()
     toggle(tabs.care,"AutoBaby","Bebek görevleri","Bebek rolüne geçer ve ihtiyaçları yapar.",function()return care.snapshot().autoBaby end,care.setAutoBaby)
     toggle(tabs.care,"AutoSwap","Yetişkin peti değiştir","Büyümemiş pete otomatik geçer.",function()return care.snapshot().autoSwap end,care.setAutoSwap)
     toggle(tabs.care,"PreferEggs","Yumurta tercih et","Yumurtaları görevlerle açar; bitince rastgele petle devam eder. Pet değişimine önceliklidir.",function()return care.snapshot().preferEggs end,care.setPreferEggs)
+    toggle(tabs.care,"AutoAgePotion","Otomatik Age-Up iksiri","Envanterdeki Age-Up iksirlerini seçili pet yetişkin olana kadar kullanır; yumurtalarda bekler.",function()return inventoryAutomation.ageEnabled end,inventoryAutomation.setAge)
+    local ageStatus=paragraph(tabs.care,"AgePotionStatus","Age-Up durumu")
     local waterBudgetInput=tabs.care:CreateInput("WaterBudget",{Title="Su alımı bütçesi (0–1000 Bucks)",Description="Oturum limiti. Bebek su isterken kullanır; limit dolunca susuzluk bekler.",Default=tostring(care.snapshot().waterBudget),Numeric=true,Finished=true,
         Callback=action(function(value)if tonumber(value)~=care.snapshot().waterBudget then care.setWaterBudget(value)end end)})
     hub.controls.WaterBudget=waterBudgetInput
@@ -6862,6 +7397,11 @@ local ok,err=xpcall(function()
     toggle(tabs.candy,"CandyEnabled","Otomatik şeker topla","Admin Abuse şeker yağmurundaki Candy Corn'u toplar.",function()return candy.enabled end,candy.setEnabled)
     local candyStatus=paragraph(tabs.candy,"CandyStatus","Şeker durumu")
     tabs.candy:CreateParagraph("CandyInfo",{Title="Toplama",Content="Ghost Gallery sırasında bekler.\nHarita / parti konumunda gelen yeni şekerleri izler."})
+    toggle(tabs.crypt,"CryptESP","Doğru mezar ESP","Merdivenli mezarı oyun verisinden bulur; anahtar harcamaz.",function()return crypt.enabled end,crypt.setEnabled)
+    toggle(tabs.crypt,"CryptAuto","Doğru mezarları aç / son ödülü al","Crypt içindeyken her merdivenli mezara bir anahtar kullanır; ödülden sonra tekrar eder.",function()return inventoryAutomation.cryptEnabled end,inventoryAutomation.setCrypt)
+    local cryptStatus=paragraph(tabs.crypt,"CryptStatus","Mezar / kat durumu")
+    local inventoryStatus=paragraph(tabs.crypt,"InventoryStatus","Anahtar / iksir otomasyonu")
+    tabs.crypt:CreateParagraph("CryptInfo",{Title="Merdiven yolu",Content="Yeşil: merdivenli doğru mezar.\nMavi: açılmış merdiven.\nKat ilerledikçe işaret yenilenir. Crypt dışında işaretler kaldırılır."})
     toggle(travelTabs.pages.care.tab,"AutoVenues","Yalnızca konum görevleri","Okul, salon, pizza ve kafe takibi.",function()return care.snapshot().autoVenues end,care.setAutoVenues)
     travelButtons(travelTabs.pages.care.tab,catalog.care)
     travelButtons(travelTabs.pages.shops.tab,catalog.shops)
@@ -6888,14 +7428,17 @@ local ok,err=xpcall(function()
         hub.controls[id]=input
     end
     transferInput("TransferAmount","Tek ödeme (1–50 Bucks)","amount",transfer.setAmount)
+    transferInput("TransferBatch","Bir gruptaki ödeme sayısı (1–20)","batchCount",transfer.setBatchCount)
     transferInput("TransferInterval","Ödeme aralığı (60–3600 saniye)","interval",transfer.setInterval)
     transferInput("TransferLimit","Toplam limit (0 = sınırsız)","limit",transfer.setLimit)
     transferInput("TransferReserve","Bakiyede bırakılacak Bucks","reserve",transfer.setReserve)
     toggle(tabs.transfer,"TransferEnabled","Sürekli para aktar","Seçilen oyuncunun kasasına düzenli ödeme yapar.",function()return transfer.enabled end,transfer.setEnabled)
+    toggle(tabs.transfer,"TransferRemoteOnly","Konum değiştirmeden ödeme","Kaydedilmiş kasaya native çağrı gönderir. Ayarı değiştirmek için aktarımı durdur.",function()return transfer.remoteOnly end,transfer.setRemoteOnly)
+    tabs.transfer:CreateButton{Title="Bu evdeki kasayı kaydet",Callback=action(function()transfer.captureRegister();ui:Notify{Title="Kasa kaydedildi",Content="Bu sunucuda konum değiştirmeden ödeme için hazır.",Duration=4}end)}
     local transferStatus=paragraph(tabs.transfer,"TransferStatus","Aktarım durumu")
     tabs.transfer:CreateButton{Title="Aktarımı durdur",Callback=action(function()transfer.setEnabled(false)end)}
     tabs.transfer:CreateButton{Title="Aktarım sayacını sıfırla",Callback=action(transfer.reset)}
-    tabs.transfer:CreateParagraph("TransferInfo",{Title="Kasa üzerinden Bucks",Content="Her ödeme en fazla 50 Bucks. Aktarım sırasında bakım kısa süre bekler, ardından devam eder. Ghost Gallery sırasında aktarım duraklar. Kasa doluysa oyunun bekleme süresi uygulanır. Her yüklemede aktarım kapalı başlar."})
+    tabs.transfer:CreateParagraph("TransferInfo",{Title="Kasa üzerinden toplu Bucks",Content="Her ödeme en fazla 50 Bucks. Bir gruptaki ödemeler, her kesinti doğrulandıktan sonra sırayla gönderilir. Kasa reddederse grup durur ve bekler. Konum değiştirmeden ödeme için kasa kimliği bu sunucuda kaydedilmiş olmalı; kaydetmek için hedefin evine bir kez gir. Her yüklemede aktarım kapalı başlar."})
     tabs.tools:CreateButton{Title="SimpleSpy'ı aç",Callback=action(function()
         if not env.SimpleSpy or not _G.SimpleSpyExecuted then
             local fn,compileError=loadstring(spySource,"=Bulbul-SimpleSpy");assert(fn,compileError);fn()
@@ -6949,7 +7492,8 @@ local ok,err=xpcall(function()
         local selectedLabel=petLabels[snap.selected]
         if selectedLabel and petSelect.Value~=selectedLabel then petSelect:SetValue(selectedLabel) end
         local actual={AutoPets=snap.autoPets,AutoBaby=snap.autoBaby,AutoSwap=snap.autoSwap,PreferEggs=snap.preferEggs,AntiAfk=hub.afk.enabled,StationMode=snap.stationMode,
-            AutoVenues=snap.autoVenues,GhostEnabled=ghost.enabled,GhostAutoJoin=hub.autoJoin.enabled,CandyEnabled=candy.enabled,TransferEnabled=transfer.enabled}
+            AutoVenues=snap.autoVenues,GhostEnabled=ghost.enabled,GhostAutoJoin=hub.autoJoin.enabled,CandyEnabled=candy.enabled,TransferEnabled=transfer.enabled,CryptESP=crypt.enabled,
+            CryptAuto=inventoryAutomation.cryptEnabled,AutoAgePotion=inventoryAutomation.ageEnabled,TransferRemoteOnly=transfer.remoteOnly}
         for id,value in pairs(actual) do local control=hub.controls[id];if control.Value~=value then control:SetValue(value) end end
         local lines={string.format("%d aktif / en fazla 6 paralel iş",snap.activeCareJobs)}
         local active={}
@@ -6971,6 +7515,11 @@ local ok,err=xpcall(function()
         if signature~=guideFingerprint then guideFingerprint=signature;guideMap=newMap;guide:SetValues(values) end
         setText(ghostStatus,string.format("%s\n%s\nPuan: %s · Işınlanma: %s\nKalkış: %s%s",hub.autoJoin.status,ghost.status,ghost.score,ghost.teleports or 0,ghost.recoveryJumps or 0,ghost.error and "\n"..ghost.error or ""))
         setText(candyStatus,string.format("%s\nToplanan: %s · İstek: %s%s",candy.status,candy.confirmed,candy.sent,candy.error and "\n"..candy.error or ""))
+        local cryptSnap=crypt.snapshot()
+        setText(cryptStatus,cryptSnap.status.."\nİşaretlenen merdivenli mezar: "..cryptSnap.matched..(cryptSnap.error and "\n"..cryptSnap.error or ""))
+        local work=inventoryAutomation.snapshot()
+        local workText=work.status..string.format("\nAçılan mezar: %d · Son ödül: %d · Kullanılan iksir: %d",work.opened,work.rewards,work.potions)
+        setText(inventoryStatus,workText);setText(ageStatus,workText)
         setText(locationStatus,snap.location)
         setText(eventLocationStatus,snap.location)
         local players=game:GetService("Players"):GetPlayers()
@@ -6992,7 +7541,7 @@ local ok,err=xpcall(function()
         if targetLabel and playerSelect.Value~=targetLabel then playerSelect:SetValue(targetLabel)end
         syncingPlayers=false
         local pay=transfer.snapshot()
-        for id,field in pairs({TransferAmount="amount",TransferInterval="interval",TransferLimit="limit",TransferReserve="reserve"})do
+        for id,field in pairs({TransferAmount="amount",TransferBatch="batchCount",TransferInterval="interval",TransferLimit="limit",TransferReserve="reserve"})do
             local control=hub.controls[id];local value=tostring(transfer[field])
             if control.Value~=value then control:SetValue(value)end
         end
