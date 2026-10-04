@@ -30,7 +30,7 @@ if env.BulbulComebackLoad and env.BulbulComebackLoad.inProgress then
     warn("[bülbül comeback] Menü yüklemesi devam ediyor; tamamlanmasını bekle.")
     return env.BulbulComeback
 end
-local report={ready=false,stage="Başlatılıyor",build="pet-stability-19"}
+local report={ready=false,stage="Başlatılıyor",build="park-camp-20"}
 report.inProgress=true
 env.BulbulComebackLoad=report
 local previousCare=env.AdoptMeCompanion
@@ -717,7 +717,14 @@ local newVoidFarm=(function()
 -- Physical scene and server care context are deliberately separate.
 -- Native transitions always win; this controller never enters an interior.
 return function(ctx)
-    local farm={active=false,context=nil,origin=nil,scene=nil,returnPending=false}
+    local farm={active=false,context=nil,origin=nil,scene=nil,returnPending=false,
+        area=nil,areaOwners={},areaReturnPending=false}
+    local function returnArea()
+        if not farm.areaReturnPending or not farm.active then return end
+        if not ctx.Ready() or ctx.Forced() or ctx.Scene()~=farm.scene then return end
+        ctx.MovePlatform(nil)
+        farm.area=nil;farm.areaReturnPending=false
+    end
     function farm.finishReturn()
         if not farm.returnPending then return true end
         if ctx.Forced() or ctx.Scene()~=farm.scene then farm.returnPending=false;return true end
@@ -733,6 +740,9 @@ return function(ctx)
         if not (farm.returnPending and farm.scene==scene and ctx.OnPlatform())then farm.origin=ctx.Pivot()end
         farm.scene=scene
         farm.returnPending=false
+        assert(next(farm.areaOwners)==nil,"Alan görevi temizliği bekleniyor.")
+        if ctx.ResetPlatform then ctx.ResetPlatform() end
+        farm.area=nil;farm.areaReturnPending=false
         ctx.Create()
         farm.active=true
         ctx.Place()
@@ -747,6 +757,26 @@ return function(ctx)
         ctx.Send(destination,destination=="housing" and ctx.Player or nil,nil)
         farm.context=destination
     end
+    function farm.acquireArea(kind,owner)
+        assert(owner,"Alan görevi sahibi gerekli.")
+        assert(not farm.area or farm.area==kind,"Başka bir alan görevi sürüyor.")
+        farm.setContext("MainMap")
+        if not farm.area then
+            local frame=assert(ctx.AreaFrame(kind),"Görev alanı henüz yüklenmedi.")
+            farm.area=kind
+            farm.areaOwners[owner]=true
+            ctx.MovePlatform(frame)
+        else farm.areaOwners[owner]=true end
+        farm.areaReturnPending=false
+    end
+    function farm.releaseArea(owner)
+        if not farm.areaOwners[owner] then return end
+        farm.areaOwners[owner]=nil
+        if next(farm.areaOwners)==nil then
+            farm.areaReturnPending=true
+            returnArea()
+        end
+    end
     function farm.suspend(returnToOrigin)
         local current=ctx.Scene()
         if farm.context and not ctx.Forced() and current==farm.scene then
@@ -760,6 +790,7 @@ return function(ctx)
     function farm.maintain()
         if not farm.active then return false end
         if ctx.Forced() or not ctx.Ready() or ctx.Scene()~=farm.scene then farm.suspend(false);return false end
+        returnArea()
         ctx.Create()
         if ctx.NeedsRecovery() then ctx.Place() end
         return true
@@ -769,12 +800,17 @@ end
 
 end)()
 local voidCarePlan=(function()
--- Only native, location-independent care paths are scheduled from the platform.
+-- Native care stays on the platform; authorized area tasks move the platform.
 return function(row,ctx)
     local kind=row.kind
     local actor="actor:"..(row.target=="baby" and "baby" or tostring(row.unique))
     local destination=ctx.anchor and ctx.anchor.plan.location or ctx.current
-    local plan={location=destination,atStation=true,stayPut=true,resources={},stallTimeout=60}
+    local plan={location=destination,zone="void-home",atStation=true,stayPut=true,resources={},stallTimeout=60}
+    if ctx.platformAreas and ctx.platformAreas[kind] then
+        plan.location,plan.zone,plan.mode="MainMap",kind,"platform-area"
+        if ctx.anchor and ctx.anchor.plan.zone==kind then plan.anchor=ctx.anchor end
+        return plan
+    end
     if ctx.areaKinds[kind] then
         ctx.waiting[kind]="Bu görev sunucuda gerçek alan/mesafe kontrolü istiyor; platformdan tamamlanamıyor."
         return nil
@@ -1201,6 +1237,7 @@ local stationWaiting = {}
 local stationInitialized, stationRelative, createCareStation = false, nil, nil
 local voidMode=true
 local platformCF=CFrame.new(0,50000,0)
+local platformHomeCF=platformCF
 local platformArt=nil
 local voidFarm,remoteHouse,nextHouseRead=nil,nil,0
 local remoteModels={}
@@ -1496,6 +1533,7 @@ local function releaseCare(owned)
     if owned.tool then pcall(function() Tools.unequip(owned.tool) end) end
     if owned.walking or owned.walkRenderName then stopWalking(owned)end
     if owned.block and occupiedBlocks[owned.block] == owned then occupiedBlocks[owned.block] = nil end
+    if owned.platformArea then voidFarm.releaseArea(owned)end
     owned.released = true
     return true
 end
@@ -1652,7 +1690,37 @@ createCareStation = function(restore)
     title.TextColor3, title.TextStrokeTransparency, title.TextSize = Color3.new(1, 1, 1), 0.3, 13
     title.Font, title.Parent = Enum.Font.GothamBold, titleGui
 end
+local function resetPlatform()
+    platformCF=platformHomeCF
+    if careStation and careStation.Parent then careStation.CFrame=platformCF end
+end
+local function placeOnPlatform()
+    local character=assert(player.Character,"Karakter yükleniyor.")
+    character:PivotTo(platformCF*CFrame.new(0,4,0))
+    local root=character:FindFirstChild("HumanoidRootPart")
+    if root then root.AssemblyLinearVelocity=Vector3.zero;root.AssemblyAngularVelocity=Vector3.zero end
+    for _,wrapper in pairs(Equipped.get_my_equipped_char_wrappers())do
+        local entity=load("PetEntityManager").get_pet_entity(wrapper.char)
+        if entity then load("PetEntityManager").mark_for_immediate_teleport(entity)end
+    end
+end
 voidFarm=newVoidFarm({Player=player,Ready=transport.isReady,Forced=MinigameForcedState.is_enabled,
+    ResetPlatform=resetPlatform,
+    MovePlatform=function(cf)
+        platformCF=cf or platformHomeCF
+        createCareStation()
+        careStation.CFrame=platformCF
+        placeOnPlatform()
+    end,
+    AreaFrame=function(kind)
+        local map=workspace:FindFirstChild("StaticMap")
+        local area=map and map:FindFirstChild(kind=="bored"and"Park"or"Campsite")
+        local target=area and area:FindFirstChild(kind=="bored"and"AilmentTarget"or"CampsiteOrigin")
+        if not target then return nil end
+        -- Park allows +170 Y; camp requires a radius of 110. Keep a large
+        -- vertical margin for both the avatar and its following pet.
+        return CFrame.new(target.Position+Vector3.new(0,60,0))
+    end,
     Drained=function()return not busy and actionPending==0 and careScheduler and careScheduler.Count()==0 end,
     Scene=Interiors.get_current_location,Create=function()createCareStation()end,
     Pivot=function()return player.Character and player.Character:GetPivot()end,
@@ -1668,16 +1736,7 @@ voidFarm=newVoidFarm({Player=player,Ready=transport.isReady,Forced=MinigameForce
             math.abs(root.Position.X-platformCF.Position.X)>110 or math.abs(root.Position.Z-platformCF.Position.Z)>110)
     end,
     Return=function(cf)if player.Character then player.Character:PivotTo(cf)end end,
-    Place=function()
-        local character=assert(player.Character,"Karakter yükleniyor.")
-        character:PivotTo(platformCF*CFrame.new(0,4,0))
-        local root=character:FindFirstChild("HumanoidRootPart")
-        if root then root.AssemblyLinearVelocity=Vector3.zero;root.AssemblyAngularVelocity=Vector3.zero end
-        for _,wrapper in pairs(Equipped.get_my_equipped_char_wrappers())do
-            local entity=load("PetEntityManager").get_pet_entity(wrapper.char)
-            if entity then load("PetEntityManager").mark_for_immediate_teleport(entity)end
-        end
-    end})
+    Place=placeOnPlatform})
 local houseReader=newHouseReader({Now=os.clock,Wait=task.wait,
     Check=function(valid)
         assert(alive,"Ev bilgisi: bakım kaldırıldı.")
@@ -2419,6 +2478,14 @@ local function performCare(row, token, owned, plan)
     if row.target == "pet" then bounded(equip, row, token, 15) end
     local current = currentTask(row)
     if not current then return end
+    if plan.mode == "platform-area" then
+        owned.platformArea=true
+        plan.job.stage=(row.kind=="bored"and"Park"or"Kamp").." · platformda sunucu ilerlemesi"
+        voidFarm.acquireArea(row.kind,owned)
+        plan.ready=true
+        assert(waitTask(row,token,85),"Alan görevi sunucuda tamamlanmadı; otomatik yeniden denenecek.")
+        return
+    end
     if plan.mode == "observe" then
         plan.ready = true
         if row.target=="baby" and (row.kind=="sleepy" or row.kind=="dirty" or row.kind=="toilet") then
@@ -2474,6 +2541,7 @@ local function planCare(row, scheduler)
         return voidCarePlan(row,{current=locationId(),anchor=scheduler.Anchor and scheduler.Anchor(),waiting=stationWaiting,
             venues=venues,foodKinds=foodKinds,foodVenues=foodVenues,food=findFood(row.kind,row.target),
             furniture=findFurniture(row.kind,row.target,scheduler),
+            platformAreas={bored=true,camping=true},
             areaKinds={bored=true,camping=true,beach_party=true,party_zone=true,rain_puddle=true,snowman=true,leaf_pile=true,diving_board=true}})
     end
     local actor = "actor:" .. (row.target == "pet" and tostring(row.unique) or "baby")
@@ -2972,8 +3040,9 @@ function api.snapshot()
         petEquipPending=petEquipTarget~=nil,
         autoPets = autoPets, autoBaby = autoBaby, babyTasks = babyRows, team = data("team"),
         careState = careScheduler.Snapshot()[1], careJobs = careScheduler.Snapshot(),
-        activeCareJobs = careScheduler.Count(), peakCareJobs = careScheduler.peak, schedulerVersion = 9,
+        activeCareJobs = careScheduler.Count(), peakCareJobs = careScheduler.peak, schedulerVersion = 10,
         voidFarm=voidFarm and voidFarm.active or false,logicalLocation=voidFarm and voidFarm.context,
+        platformArea=voidFarm and voidFarm.area,platformPosition=platformCF.Position,
         remoteHouseError=api.remoteHouseError,
         platformBirds=platformArt~=nil and careStation~=nil and careStation.Parent~=nil,
         paused=pauseReason~=nil,pauseReason=pauseReason,recoveries=careScheduler.recoveries,
