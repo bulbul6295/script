@@ -30,7 +30,7 @@ if env.BulbulComebackLoad and env.BulbulComebackLoad.inProgress then
     warn("[bülbül comeback] Menü yüklemesi devam ediyor; tamamlanmasını bekle.")
     return env.BulbulComeback
 end
-local report={ready=false,stage="Başlatılıyor",build="bulbul-theme-15"}
+local report={ready=false,stage="Başlatılıyor",build="ghost-return-16"}
 report.inProgress=true
 env.BulbulComebackLoad=report
 local previousCare=env.AdoptMeCompanion
@@ -109,7 +109,7 @@ return function(ctx,initialEnabled)
     local state={running=true,enabled=initialEnabled~=false,phase="idle",status="Yeni tur bekleniyor",
         paused=false,attempts=0,joins=0,resumes=0,generation=0}
     local nextAttempt,transporting,ownedQueue,exitRetryAt=0,false,false,0
-    local transportDeadline,transportCancelled
+    local transportDeadline,transportCancelled,transportKind,staleQueueSince
     local function pause(reason)
         if not state.paused then ctx.Pause(reason);state.paused=true end
     end
@@ -140,9 +140,10 @@ return function(ctx,initialEnabled)
             -- Cancel future movement, while retaining the lease until the
             -- pending native transport returns and invokes its callback.
             transportCancelled=true;state.generation+=1
-            state.error="Katılım geçişi zaman aşımına uğradı."
+            state.error=transportKind=="exit" and "Tur dönüşü uzadı · mevcut geçiş bekleniyor."or "Katılım geçişi zaman aşımına uğradı."
         end
         if current.active then
+            staleQueueSince=nil
             pause("Ghost Gallery · diğer otomasyonlar duraklatıldı")
             if state.phase~="playing" then state.joins+=1 end
             state.phase="playing";state.status="Turda · görevler duraklatıldı"
@@ -150,6 +151,7 @@ return function(ctx,initialEnabled)
             return
         end
         if current.transition then
+            staleQueueSince=nil
             pause("Mini oyun geçişi · görevler duraklatıldı")
             state.status="Tur geçişi tamamlanıyor"
             return
@@ -161,12 +163,34 @@ return function(ctx,initialEnabled)
         if state.phase=="exiting" then
             pause("Ghost Gallery çıkışı · görevler duraklatıldı")
             state.status="Tur bitti · katılım alanından çıkılıyor"
-            if transporting then state.status="Bekleyen katılım geçişi tamamlanıyor";return end
+            if transporting then state.status=transportKind=="exit" and "Ana haritaya dönüş tamamlanıyor"or "Bekleyen katılım geçişi tamamlanıyor";return end
+            if ctx.ReturnToFarm and current.farmReady~=true then
+                -- Moving beyond one guessed ring point is not a reliable exit.
+                -- The native entrance tears down the queue listener and its flags.
+                if now<exitRetryAt then return end
+                if not ctx.Ready()then state.status="Tur dönüşü için önceki işlemler bekleniyor";return end
+                transporting=true;transportKind="exit";transportCancelled=false;transportDeadline=now+45
+                state.status="Tur bitti · ana haritaya dönülüyor"
+                local completed=false
+                local function done(success,reason)
+                    if completed then return end
+                    completed=true;transporting=false
+                    if success then state.error=nil;exitRetryAt=ctx.Now()+.5
+                    else state.error=tostring(reason);exitRetryAt=ctx.Now()+3 end
+                    -- Resume only from the next physical-state read, never from
+                    -- an RPC acknowledgement or a stale successful callback.
+                end
+                local ok,err=pcall(ctx.ReturnToFarm,done,function()
+                    return state.running and state.phase=="exiting" and not transportCancelled
+                end)
+                if not ok then done(false,err)end
+                return
+            end
             if current.queued or current.inJoinZone then
                 if now>=exitRetryAt then ctx.LeaveQueue();exitRetryAt=now+1 end
                 return
             end
-            state.phase="idle";resume();state.status="Tur bitti · görevler devam ediyor"
+            state.phase="idle";state.error=nil;resume();state.status="Tur bitti · görevler devam ediyor"
             nextAttempt=now+2
             return
         end
@@ -184,6 +208,21 @@ return function(ctx,initialEnabled)
             state.phase="idle";resume();state.status="Otomatik katılım kapalı";return
         end
         local timestamp=current.timestamp
+        local outsideWindow=type(timestamp)=="number" and (timestamp-now>45 or timestamp-now< -10)
+        if (current.queued or current.inJoinZone) and outsideWindow and not current.loading then
+            if not ownedQueue then
+                state.phase="exiting";exitRetryAt=0;state.status="Tur alanındaki eski sıra temizleniyor";return
+            elseif state.cycle and timestamp~=state.cycle then
+                -- A short-lived round notification can be missed during scene
+                -- replacement/reload. A new future cycle must not hold farm for
+                -- the entire next countdown in the old ring.
+                staleQueueSince=staleQueueSince or now
+                if now-staleQueueSince>=5 then
+                    state.finishedCycle=state.cycle;ownedQueue=false;state.phase="exiting";exitRetryAt=0
+                    state.status="Yeni tur beklenirken eski sıra temizleniyor";return
+                end
+            else staleQueueSince=nil end
+        else staleQueueSince=nil end
         if current.queued then
             pause("Ghost Gallery sırası · görevler duraklatıldı")
             state.phase="waiting";state.status="Sırada · tur bekleniyor"
@@ -209,7 +248,7 @@ return function(ctx,initialEnabled)
         pause("Ghost Gallery hazırlığı · görevler duraklatıldı")
         state.phase="preparing";state.status="Bakım işlemleri temizleniyor"
         if not ctx.Ready() then return end
-        transporting=true;transportCancelled=false;transportDeadline=now+45;state.attempts+=1
+        transporting=true;transportKind="join";transportCancelled=false;transportDeadline=now+45;state.attempts+=1
         local generation=state.generation
         local completed=false
         local function done(success,reason)
@@ -8569,20 +8608,45 @@ local ok,err=xpcall(function()
         local p=collider.CFrame:PointToObjectSpace(root.Position)/collider.Size
         return math.abs(p.X)<=0.5 and p.Y*p.Y+p.Z*p.Z<=0.25
     end
-    hub.autoJoin=newGhostCycle({Now=Clock.now,Read=function()
+    local function readGhostState()
         local m=manager();local loc=location();local cycle=m and CD.get(m.cycle_timestamp_key)
         local active=m and m.is_participating==true
-        return {active=active,transition=Forced.is_enabled() or (not active and m and m.instanced_minigame~=nil) or
-                (loc and loc.destination_id:find("ManorMinigameInterior",1,true)~=nil),
+        local inGame=loc and loc.destination_id:find("ManorMinigameInterior",1,true)~=nil
+        local ready=care.transport.isReady()
+        local inLobby=loc and m and loc.destination_id==m.join_zone_destination_id
+        local queued=m and m.is_queued==true
+        return {active=active,transition=Forced.is_enabled() or inGame or not ready,
+            farmReady=ready and loc~=nil and not inLobby and not inGame and not queued,
             timestamp=cycle and cycle.timestamp,queued=m and m.is_queued,inJoinZone=inJoinZone(),
             loading=m and m.minigame_state:get("players_loading"),canInvite=Forced.can_receive_invites()}
-    end,Ready=function() local s=care.snapshot();local b=houseBuild.snapshot();return care.transport.isReady() and not b.busy and not b.pending and not transfer.busy and not inventoryAutomation.busy and not s.busy and s.activeCareJobs==0 end,
+    end
+    hub.autoJoin=newGhostCycle({Now=Clock.now,Read=readGhostState,
+    Ready=function() local s=care.snapshot();local b=houseBuild.snapshot();return care.transport.isReady() and not b.busy and not b.pending and not transfer.busy and not inventoryAutomation.busy and not s.busy and s.activeCareJobs==0 end,
         Pause=function(reason)cyclePauseReason=reason;transfer.setPaused(reason);care.setPaused(reason);candy.setPaused(reason)end,
         Resume=function()
             transfer.setPaused(nil)
             if care.snapshot().pauseReason==cyclePauseReason then care.setPaused(nil) end
             candy.setPaused(nil);cyclePauseReason=nil
         end,LeaveQueue=leaveQueue,
+        ReturnToFarm=function(done,valid)
+            task.spawn(function()
+                local returned,returnError=xpcall(function()
+                    assert(hub.running and valid(),"Tur dönüşü iptal edildi.")
+                    local m=manager()
+                    assert(not (m and m.is_participating) and not Forced.is_enabled(),"Turun çıkış geçişi bekleniyor.")
+                    care.transport.enter("MainMap","MainDoor",{},valid)
+                    local deadline=os.clock()+8
+                    repeat
+                        assert(hub.running and valid(),"Tur dönüşü iptal edildi.")
+                        local scene=readGhostState()
+                        if scene.farmReady and not scene.transition and not scene.active then return end
+                        assert(os.clock()<deadline,"Ana haritada sıra temizliği henüz doğrulanmadı.")
+                        task.wait(.1)
+                    until false
+                end,debug.traceback)
+                done(returned,returnError)
+            end)
+        end,
         Prepare=function(done,valid)
             task.spawn(function()
                 local moved,moveError=xpcall(function()
