@@ -30,7 +30,7 @@ if env.BulbulComebackLoad and env.BulbulComebackLoad.inProgress then
     warn("[bülbül comeback] Menü yüklemesi devam ediyor; tamamlanmasını bekle.")
     return env.BulbulComeback
 end
-local report={ready=false,stage="Başlatılıyor",build="park-camp-20"}
+local report={ready=false,stage="Başlatılıyor",build="area-care-21"}
 report.inProgress=true
 env.BulbulComebackLoad=report
 local previousCare=env.AdoptMeCompanion
@@ -723,7 +723,7 @@ return function(ctx)
         if not farm.areaReturnPending or not farm.active then return end
         if not ctx.Ready() or ctx.Forced() or ctx.Scene()~=farm.scene then return end
         ctx.MovePlatform(nil)
-        farm.area=nil;farm.areaReturnPending=false
+        farm.area=nil;farm.areaTarget=nil;farm.areaReturnPending=false
     end
     function farm.finishReturn()
         if not farm.returnPending then return true end
@@ -742,7 +742,7 @@ return function(ctx)
         farm.returnPending=false
         assert(next(farm.areaOwners)==nil,"Alan görevi temizliği bekleniyor.")
         if ctx.ResetPlatform then ctx.ResetPlatform() end
-        farm.area=nil;farm.areaReturnPending=false
+        farm.area=nil;farm.areaTarget=nil;farm.areaReturnPending=false
         ctx.Create()
         farm.active=true
         ctx.Place()
@@ -757,17 +757,28 @@ return function(ctx)
         ctx.Send(destination,destination=="housing" and ctx.Player or nil,nil)
         farm.context=destination
     end
-    function farm.acquireArea(kind,owner)
+    function farm.acquireArea(kind,owner,destination)
         assert(owner,"Alan görevi sahibi gerekli.")
         assert(not farm.area or farm.area==kind,"Başka bir alan görevi sürüyor.")
-        farm.setContext("MainMap")
+        farm.setContext(destination or "MainMap")
         if not farm.area then
-            local frame=assert(ctx.AreaFrame(kind),"Görev alanı henüz yüklenmedi.")
+            local frame,target=ctx.AreaFrame(kind,owner,destination or "MainMap")
+            assert(frame,"Görev alanı henüz yüklenmedi.")
+            if ctx.OwnerValid then assert(ctx.OwnerValid(owner),"Alan görevi iptal edildi.")end
+            farm.setContext(destination or "MainMap")
             farm.area=kind
+            farm.areaTarget=target
             farm.areaOwners[owner]=true
             ctx.MovePlatform(frame)
         else farm.areaOwners[owner]=true end
         farm.areaReturnPending=false
+        return farm.areaTarget
+    end
+    function farm.repositionArea(owner,frame)
+        assert(farm.areaOwners[owner],"Alan görevi artık platformu kullanmıyor.")
+        farm.setContext(farm.context)
+        if ctx.OwnerValid then assert(ctx.OwnerValid(owner),"Alan görevi iptal edildi.")end
+        ctx.MovePlatform(frame)
     end
     function farm.releaseArea(owner)
         if not farm.areaOwners[owner] then return end
@@ -807,7 +818,17 @@ return function(row,ctx)
     local destination=ctx.anchor and ctx.anchor.plan.location or ctx.current
     local plan={location=destination,zone="void-home",atStation=true,stayPut=true,resources={},stallTimeout=60}
     if ctx.platformAreas and ctx.platformAreas[kind] then
-        plan.location,plan.zone,plan.mode="MainMap",kind,"platform-area"
+        local area=ctx.platformAreas[kind]
+        if type(area)=="table" and area.petOnly and row.target=="baby"then
+            ctx.waiting[kind]="Bu görevi oyun yalnız petlere veriyor.";return nil
+        end
+        if kind=="party_zone"and not ctx.party then ctx.waiting[kind]="Parti etkinliği bekleniyor.";return nil end
+        plan.location,plan.zone,plan.mode=ctx.areaDestination or "MainMap",kind,"platform-area"
+        if type(area)=="table"then
+            plan.areaInteraction=area.interaction
+            plan.stallTimeout=area.interaction and 130 or 60
+            if area.interaction then plan.resources={actor,"walking","tools"}end
+        end
         if ctx.anchor and ctx.anchor.plan.zone==kind then plan.anchor=ctx.anchor end
         return plan
     end
@@ -847,6 +868,114 @@ return function(row,ctx)
     else ctx.waiting[kind]="Platformdan çalışan doğrulanmış görev yolu bulunamadı.";return nil end
     if ctx.anchor and plan.location==ctx.anchor.plan.location then plan.anchor=ctx.anchor end
     return plan
+end
+
+end)()
+local platformAreas=(function()
+-- Native area predicates and real furniture interactions use different paths.
+local definitions={
+    bored={seconds=85},camping={seconds=85},beach_party={seconds=85},
+    party_zone={seconds=30},rain_puddle={seconds=35,petOnly=true},snowman={seconds=40,petOnly=true},
+    leaf_pile={seconds=130,petOnly=true,interaction=true},
+    diving_board={seconds=130,petOnly=true,interaction=true},
+}
+local function resolve(kind,ctx)
+    local definition=assert(definitions[kind],"Bilinmeyen alan görevi: "..tostring(kind))
+    local result={kind=kind,seconds=definition.seconds,interaction=definition.interaction,location=ctx.destination}
+    local position
+    if kind=="bored" or kind=="camping" then
+        local target=ctx.Part(kind=="bored"and{"Park","AilmentTarget"}or{"Campsite","CampsiteOrigin"})
+        assert(target,"Park/kamp alanı henüz yüklenmedi.")
+        position=target.Position+Vector3.new(0,60,0)
+    elseif kind=="beach_party" then
+        local target=assert(ctx.Part({"Beach","BeachPartyAilmentTarget"}),"Plaj alanı henüz yüklenmedi.")
+        local nav=ctx.Part({"Beach","BeachPartyNavTarget"})
+        for _,candidate in ipairs({target.Position,nav and nav.Position or target.Position})do
+            local elevated=Vector3.new(candidate.X,target.Position.Y+60,candidate.Z)
+            if (elevated-target.Position).Magnitude<600 and ctx.BeachContains(elevated)then position=elevated;break end
+        end
+        assert(position,"Plajın gerçek sınırları içinde güvenli bir nokta bulunamadı.")
+    elseif kind=="party_zone" then
+        local party=assert(ctx.Party(),"Parti etkinliği sona erdi.")
+        assert(party.destination_id==ctx.destination,"Parti konumu değişti; yeniden planlanacak.")
+        local origin=ctx.FurnitureOrigin()or CFrame.identity
+        position=(origin*CFrame.new(unpack(party.position))).Position+Vector3.new(0,60,0)
+        result.party=party
+    elseif kind=="rain_puddle" or kind=="snowman" then
+        local target,distance
+        local origin=ctx.Position()
+        for _,model in ipairs(ctx.Tagged(kind=="rain_puddle"and"RainPuddleServer"or"SnowmanServer"))do
+            if ctx.Present(model)then
+                local p=model:GetPivot().Position
+                local d=(p-origin).Magnitude
+                if not distance or d<distance then target,distance=model,d end
+            end
+        end
+        assert(target,"Hava durumu alanı henüz yüklenmedi; yeniden denenecek.")
+        result.target=target
+        position=target:GetPivot().Position+Vector3.new(0,60,0)
+    else
+        local entry=assert(ctx.Furniture(kind),"Gerçek hava durumu mobilyası henüz kullanıma hazır değil.")
+        assert(entry.unique and entry.model and entry.block,"Hava durumu mobilya kimliği eksik.")
+        result.entry=entry
+        -- Stand close to the real use block. Native diving may temporarily
+        -- take the avatar off this platform for its actual jump animation.
+        position=entry.block.Position-Vector3.new(0,3,0)
+    end
+    result.frame=CFrame.new(position)
+    return result
+end
+return {definitions=definitions,resolve=resolve}
+
+end)()
+local newPlatformAreaCare=(function()
+-- Completion is read from server ailments; native animations send their own Done event.
+return function(ctx)
+    return function(row,token,owned,plan)
+        ctx.Check(row,token)
+        ctx.Prepare(row,token,plan)
+        ctx.Check(row,token)
+        owned.platformArea,owned.areaRow=true,row
+        plan.job.stage=(ctx.Label(row.kind)or row.kind).." · görev platformu hazırlanıyor"
+        local target=ctx.Acquire(row,token,owned,plan)
+        plan.ready=true
+        if row.kind=="rain_puddle"or row.kind=="snowman"or target.interaction then
+            ctx.ExitPet(row,token,owned)
+        end
+        if not target.interaction then
+            plan.job.stage=(ctx.Label(row.kind)or row.kind).." · gerçek alanda sunucu ilerlemesi"
+            assert(ctx.WaitTask(row,token,target.seconds),"Alan görevi sunucuda tamamlanmadı; yeniden denenecek.")
+            return
+        end
+        local deadline=ctx.Now()+target.seconds
+        local entry=target.entry
+        while ctx.Current(row)and ctx.Now()<deadline do
+            ctx.Check(row,token)
+            while not entry and ctx.Now()<deadline do
+                plan.job.stage="Gerçek hava durumu mobilyası · boşalması bekleniyor"
+                ctx.Wait(row,token,.4)
+                ctx.Check(row,token)
+                if not ctx.Current(row)then return end
+                entry=ctx.Furniture(row.kind)
+            end
+            assert(entry,"Hava durumu mobilyası henüz kullanıma hazır değil.")
+            ctx.Move(owned,entry)
+            ctx.Reserve(owned,entry,plan)
+            local before=(ctx.Current(row)or{}).progress or 0
+            owned.areaAnimation=true
+            plan.job.stage="Native "..(ctx.Label(row.kind)or row.kind).." etkileşimi"
+            ctx.Use(row,token,owned,entry)
+            owned.areaAnimation=false
+            ctx.Unreserve(owned,entry)
+            if ctx.WaitTask(row,token,1)then return end
+            local current=ctx.Current(row)
+            assert(current and(current.progress or 0)>before,"Native etkileşim sunucuda ilerleme vermedi.")
+            ctx.Move(owned,entry)
+            ctx.Wait(row,token,ctx.Cooldown(row.kind))
+            entry=ctx.Furniture(row.kind)
+        end
+        assert(not ctx.Current(row),"Hava durumu görevi zaman aşımı; otomatik yeniden denenecek.")
+    end
 end
 
 end)()
@@ -1241,6 +1370,7 @@ local platformHomeCF=platformCF
 local platformArt=nil
 local voidFarm,remoteHouse,nextHouseRead=nil,nil,0
 local remoteModels={}
+local findSceneFurniture
 local careRoutes = {}
 local furnitureComponents = setmetatable({}, {__mode = "kv"})
 local badFurniture, lastComponentScan = setmetatable({}, {__mode = "k"}), -math.huge
@@ -1533,7 +1663,11 @@ local function releaseCare(owned)
     if owned.tool then pcall(function() Tools.unequip(owned.tool) end) end
     if owned.walking or owned.walkRenderName then stopWalking(owned)end
     if owned.block and occupiedBlocks[owned.block] == owned then occupiedBlocks[owned.block] = nil end
-    if owned.platformArea then voidFarm.releaseArea(owned)end
+    if owned.platformArea then
+        owned.areaAnimation=false
+        if careStation and careStation.Parent then careStation.CanCollide=true;careStation.CanQuery=true end
+        voidFarm.releaseArea(owned)
+    end
     owned.released = true
     return true
 end
@@ -1712,14 +1846,32 @@ voidFarm=newVoidFarm({Player=player,Ready=transport.isReady,Forced=MinigameForce
         careStation.CFrame=platformCF
         placeOnPlatform()
     end,
-    AreaFrame=function(kind)
-        local map=workspace:FindFirstChild("StaticMap")
-        local area=map and map:FindFirstChild(kind=="bored"and"Park"or"Campsite")
-        local target=area and area:FindFirstChild(kind=="bored"and"AilmentTarget"or"CampsiteOrigin")
-        if not target then return nil end
-        -- Park allows +170 Y; camp requires a radius of 110. Keep a large
-        -- vertical margin for both the avatar and its following pet.
-        return CFrame.new(target.Position+Vector3.new(0,60,0))
+    OwnerValid=function(owned)return owned.areaRow and owned.areaRow.careJob and careScheduler.Valid(owned.areaRow.careJob)end,
+    AreaFrame=function(kind,owned,destination)
+        local definition=platformAreas.resolve(kind,{destination=destination,
+            Part=function(path)
+                local target=workspace:FindFirstChild("StaticMap")
+                for _,name in ipairs(path)do target=target and target:FindFirstChild(name)end
+                return target
+            end,
+            BeachContains=function(position)
+                local map=workspace:FindFirstChild("StaticMap")
+                local beach=map and map:FindFirstChild("Beach")
+                local perimeter=beach and beach:FindFirstChild("BeachPartyAilmentPerimeter")
+                return perimeter and load("Utilities").point_in_points(position,{},perimeter)
+            end,
+            Party=function()return AdminAbuse.get_value("party_zone")end,
+            FurnitureOrigin=function()
+                local loc=Interiors.get_current_location()
+                assert(loc and loc.destination_id==destination,"Parti sahnesi henüz hazır değil.")
+                local origin=loc.interior and loc.interior:QueryDescendants("#SpecialParts>#FurnitureOrigin")[1]
+                return origin and origin.CFrame
+            end,
+            Tagged=function(tag)return game:GetService("CollectionService"):GetTagged(tag)end,
+            Present=function(model)return model:IsDescendantOf(workspace)end,
+            Position=function()return player.Character.HumanoidRootPart.Position end,
+            Furniture=function(k)return findSceneFurniture(k,"pet",careScheduler)end})
+        return definition.frame,definition
     end,
     Drained=function()return not busy and actionPending==0 and careScheduler and careScheduler.Count()==0 end,
     Scene=Interiors.get_current_location,Create=function()createCareStation()end,
@@ -1731,6 +1883,7 @@ voidFarm=newVoidFarm({Player=player,Ready=transport.isReady,Forced=MinigameForce
             math.abs(root.Position.X-platformCF.Position.X)<150 and math.abs(root.Position.Z-platformCF.Position.Z)<150
     end,
     NeedsRecovery=function()
+        for owner in pairs(voidFarm.areaOwners)do if owner.areaAnimation then return false end end
         local root=player.Character and player.Character:FindFirstChild("HumanoidRootPart")
         return root and (root.Position.Y<platformCF.Position.Y-2 or root.Position.Y>platformCF.Position.Y+35 or
             math.abs(root.Position.X-platformCF.Position.X)>110 or math.abs(root.Position.Z-platformCF.Position.Z)>110)
@@ -1794,8 +1947,7 @@ local function findRemoteFurniture(kind,target,scheduler,includeBusy)
         end
     end
 end
-local function findFurniture(kind, target, scheduler, includeBusy)
-    if voidMode then return findRemoteFurniture(kind,target,scheduler,includeBusy) end
+findSceneFurniture=function(kind, target, scheduler, includeBusy)
     local best, distance = nil, math.huge
     local root = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
     for _, model in pairs(FurnitureTracker.get_furniture_models_list()) do
@@ -1810,9 +1962,14 @@ local function findFurniture(kind, target, scheduler, includeBusy)
             local component = furnitureComponent(model)
             local furnitureData = component and component.props and component.props.furniture_data
             local occupied = furnitureData and furnitureData.occupied and furnitureData.occupied[block.Name]
-            local cooling = furnitureData and furnitureData.respawn_at and furnitureData.respawn_at > load("LiveOpsTime").now()
+            local now=load("LiveOpsTime").now()
+            local cooling = furnitureData and (furnitureData.respawn_at and furnitureData.respawn_at > now or
+                furnitureData.hide_prompt_because_used or kind=="diving_board"and furnitureData.used_at and
+                now-furnitureData.used_at<SharedConstants.diving_board_cooldown)
+            if kind=="diving_board"and component and component.used_at and
+                now-component.used_at<SharedConstants.diving_board_cooldown then cooling=true end
             local blockResource = "block:" .. tostring(model:GetAttribute("furniture_unique")) .. ":" .. block.Name
-            if block:IsA("BasePart") and boost and boost[1] == kind and permitted and
+            if model:IsDescendantOf(workspace) and block:IsA("BasePart") and boost and boost[1] == kind and permitted and
                 not occupied and not cooling and (badFurniture[block] or 0) <= os.clock() and
                 (includeBusy or not occupiedBlocks[block] and (not scheduler or not scheduler.IsReserved(blockResource))) then
                 local dist = root and (root.Position - block.Position).Magnitude or 0
@@ -1826,6 +1983,10 @@ local function findFurniture(kind, target, scheduler, includeBusy)
         end
     end
     return best
+end
+local function findFurniture(kind, target, scheduler, includeBusy)
+    if voidMode then return findRemoteFurniture(kind,target,scheduler,includeBusy)end
+    return findSceneFurniture(kind,target,scheduler,includeBusy)
 end
 local function careRouteKey(row)
     return row.target .. ":" .. tostring(row.target=="baby" and "self" or row.unique) .. ":" .. tostring(row.key) .. ":" .. tostring(row.raw.created_timestamp)
@@ -2471,6 +2632,82 @@ local function playCare(row, token, owned)
     end
     error("Oyuncak atislari sunucuda oyun gorevini tamamlamadi.")
 end
+local platformAreaCare=newPlatformAreaCare({Check=checkCare,Now=os.clock,Current=currentTask,
+    Label=function(kind)return labels[kind]end,Wait=pauseCare,WaitTask=waitTask,
+    Cooldown=function(kind)return kind=="leaf_pile"and SharedConstants.leaf_pile_cooldown or SharedConstants.diving_board_cooldown end,
+    Prepare=function(row,token,plan)
+        local loc=Interiors.get_current_location()
+        local needsScene=row.kind=="party_zone"and (not loc or loc.destination_id~=plan.location)or
+            plan.areaInteraction and (not loc or loc.destination_id~=plan.location)or
+            not workspace:FindFirstChild("StaticMap")
+        if needsScene then
+            plan.job.stage="Görev alanının native sahnesi yükleniyor"
+            bounded(function()
+                voidFarm.suspend(false)
+                transport.enter(plan.location,"MainDoor",{},function()return enabled(row,token)end)
+                checkCare(row,token)
+                voidFarm.start()
+            end,row,token,35)
+        end
+    end,
+    Acquire=function(row,token,owned,plan)
+        return bounded(function()return voidFarm.acquireArea(row.kind,owned,plan.location)end,row,token,20)
+    end,
+    ExitPet=function(row,token,owned)
+        owned.pet=row.unique
+        bounded(function()return Router.get("PetAPI/ExitFurnitureUseStates"):InvokeServer(row.unique)end,row,token,15)
+    end,
+    Furniture=function(kind)return findSceneFurniture(kind,"pet")end,
+    Move=function(owned,entry)
+        voidFarm.repositionArea(owned,CFrame.new(entry.block.Position-Vector3.new(0,3,0)))
+    end,
+    Reserve=function(owned,entry,plan)
+        local resource="block:"..tostring(entry.unique)..":"..entry.block.Name
+        assert(careScheduler.ReplaceReservation(plan.job,plan.blockResource,resource),"Hava durumu mobilyası başka göreve ayrıldı.")
+        plan.blockResource=resource
+        occupiedBlocks[entry.block]=owned;owned.block=entry.block
+    end,
+    Unreserve=function(owned,entry)
+        local kind=owned.areaRow.kind
+        badFurniture[entry.block]=os.clock()+(kind=="leaf_pile"and SharedConstants.leaf_pile_cooldown or SharedConstants.diving_board_cooldown)
+        if occupiedBlocks[entry.block]==owned then occupiedBlocks[entry.block]=nil end
+        if owned.block==entry.block then owned.block=nil end
+    end,
+    Use=function(row,token,owned,entry)
+        bounded(function()
+            local wrapper=assert(wrapperFor(row),"Pet takılı değil.")
+            local component=entry.component or furnitureComponent(entry.model)
+            local behavior=entry.behavior
+            -- These two native client functions need only the real rendered
+            -- model and their local animation state; getgc is optional.
+            component=component or {furniture=entry.model,props={furniture_data=entry.furnitureData or {}}}
+            assert(behavior.client_use and behavior.server_use,"Native hava durumu etkileşimi henüz hazır değil.")
+            owned.pet=row.unique
+            if row.kind=="diving_board"and careStation then careStation.CanCollide=false;careStation.CanQuery=false end
+            local clientDone,serverDone,clientError,serverError=false,false,nil,nil
+            owned.pending=(owned.pending or 0)+1
+            task.spawn(function()
+                local ok,err=pcall(behavior.client_use,entry.furnitureData,entry.unique,entry.model,
+                    wrapper.char,entry.block,component,wrapper)
+                if not ok then clientError=tostring(err)end
+                clientDone=true;owned.pending-=1
+            end)
+            -- The native client must install its AilmentFurnitureUse listener
+            -- before the server starts the real animation handshake.
+            task.wait()
+            owned.pending+=1
+            task.spawn(function()
+                local ok,err=pcall(function()
+                    Router.get("HousingAPI/ActivateInteriorFurniture"):InvokeServer(entry.unique,entry.block.Name,nil,wrapper.char)
+                end)
+                if not ok then serverError=tostring(err)end
+                serverDone=true;owned.pending-=1
+            end)
+            while not clientDone or not serverDone do task.wait(.1)end
+            if careStation and careStation.Parent then careStation.CanCollide=true;careStation.CanQuery=true end
+            assert(not clientError,clientError);assert(not serverError,serverError)
+        end,row,token,30)
+    end})
 local function performCare(row, token, owned, plan)
     checkCare(row, token)
     bounded(function()transport.waitReady(function()return enabled(row,token)end)end,row,token,30)
@@ -2479,11 +2716,7 @@ local function performCare(row, token, owned, plan)
     local current = currentTask(row)
     if not current then return end
     if plan.mode == "platform-area" then
-        owned.platformArea=true
-        plan.job.stage=(row.kind=="bored"and"Park"or"Kamp").." · platformda sunucu ilerlemesi"
-        voidFarm.acquireArea(row.kind,owned)
-        plan.ready=true
-        assert(waitTask(row,token,85),"Alan görevi sunucuda tamamlanmadı; otomatik yeniden denenecek.")
+        platformAreaCare(row,token,owned,plan)
         return
     end
     if plan.mode == "observe" then
@@ -2538,10 +2771,15 @@ local function performCare(row, token, owned, plan)
 end
 local function planCare(row, scheduler)
     if voidMode then
+        local party=row.kind=="party_zone"and AdminAbuse.get_value("party_zone")or nil
+        local scene=Interiors.get_current_location()
+        local destination=party and party.destination_id or
+            (row.kind=="rain_puddle"or row.kind=="snowman"or row.kind=="leaf_pile"or row.kind=="diving_board")and
+            scene and scene.destination_id=="Neighborhood"and"Neighborhood"or"MainMap"
         return voidCarePlan(row,{current=locationId(),anchor=scheduler.Anchor and scheduler.Anchor(),waiting=stationWaiting,
             venues=venues,foodKinds=foodKinds,foodVenues=foodVenues,food=findFood(row.kind,row.target),
             furniture=findFurniture(row.kind,row.target,scheduler),
-            platformAreas={bored=true,camping=true},
+            platformAreas=platformAreas.definitions,party=party,areaDestination=destination,
             areaKinds={bored=true,camping=true,beach_party=true,party_zone=true,rain_puddle=true,snowman=true,leaf_pile=true,diving_board=true}})
     end
     local actor = "actor:" .. (row.target == "pet" and tostring(row.unique) or "baby")
@@ -3040,7 +3278,7 @@ function api.snapshot()
         petEquipPending=petEquipTarget~=nil,
         autoPets = autoPets, autoBaby = autoBaby, babyTasks = babyRows, team = data("team"),
         careState = careScheduler.Snapshot()[1], careJobs = careScheduler.Snapshot(),
-        activeCareJobs = careScheduler.Count(), peakCareJobs = careScheduler.peak, schedulerVersion = 10,
+        activeCareJobs = careScheduler.Count(), peakCareJobs = careScheduler.peak, schedulerVersion = 11,
         voidFarm=voidFarm and voidFarm.active or false,logicalLocation=voidFarm and voidFarm.context,
         platformArea=voidFarm and voidFarm.area,platformPosition=platformCF.Position,
         remoteHouseError=api.remoteHouseError,
@@ -3080,6 +3318,8 @@ function api.unload()
     if env.AdoptMeCompanion == api then env.AdoptMeCompanion = nil end
 end
 
+-- Keep the standalone view in its own register scope as care adapters grow.
+;(function()
 local theme = {
     blue = Color3.fromRGB(0, 56, 184),
     ink = Color3.fromRGB(15, 42, 92),
@@ -3493,6 +3733,7 @@ return state
 
 end)()
 function api.setAutoCandy(value) candyRain.setEnabled(value) end
+end)()
 return api
 
 end
