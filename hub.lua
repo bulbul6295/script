@@ -25,18 +25,18 @@ SOFTWARE.
 
 ]]
 local env=getgenv()
-local version=(function()
+local hubVersion=(function()
 -- Increment once per completed release: 1, 1.1, 1.2, ...
-return "1.3"
+return "1.4"
 
 end)()
-local title="bülbül comeback v"..version
+local title="bülbül comeback v"..hubVersion
 assert(game.PlaceId==920587237 or game.PlaceId==132388544979740,"Bu paket Adopt Me veya Trading Hub için hazırlandı.")
 if env.BulbulComebackLoad and env.BulbulComebackLoad.inProgress then
     warn("["..title.."] Menü yüklemesi devam ediyor; tamamlanmasını bekle.")
     return env.BulbulComeback
 end
-local report={ready=false,stage="Başlatılıyor",build="hauntlet-license-39",version=version,title=title}
+local report={ready=false,stage="Başlatılıyor",build="delta-platform-40",version=hubVersion,title=title}
 report.inProgress=true
 env.BulbulComebackLoad=report
 local previousCare=env.AdoptMeCompanion
@@ -10562,7 +10562,7 @@ return function(ui,window,hub)
 end
 
 end)()
-local hub={running=true,ready=false,build=report.build,version=version,title=title,connections={},controls={},runtimeErrors={}}
+local hub={running=true,ready=false,build=report.build,version=hubVersion,title=title,connections={},controls={},runtimeErrors={}}
 local ui,care,ghost,candy,transfer,crypt,inventoryAutomation,houseBuild,window
 local function uiContext() if setthreadidentity then pcall(setthreadidentity,8) end end
 local function stopTrace()
