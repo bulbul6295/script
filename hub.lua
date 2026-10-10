@@ -27,7 +27,7 @@ SOFTWARE.
 local env=getgenv()
 local hubVersion=(function()
 -- Increment once per completed release: 1, 1.1, 1.2, ...
-return "1.7"
+return "1.8"
 
 end)()
 local title="bülbül comeback v"..hubVersion
@@ -36,7 +36,7 @@ if env.BulbulComebackLoad and env.BulbulComebackLoad.inProgress then
     warn("["..title.."] Menü yüklemesi devam ediyor; tamamlanmasını bekle.")
     return env.BulbulComeback
 end
-local report={ready=false,stage="Başlatılıyor",build="hauntlet-survival-43",version=hubVersion,title=title}
+local report={ready=false,stage="Başlatılıyor",build="hauntlet-risk-44",version=hubVersion,title=title}
 report.inProgress=true
 env.BulbulComebackLoad=report
 local previousCare=env.AdoptMeCompanion
@@ -12895,6 +12895,50 @@ function P.reconcile(s,runner,inventory)
 end
 local areaRisk={hallway=0,laboratory=.15,mechanical=.7,spider=.8,copycat=1.2,nightmare=1.5,carnival=1.4,final_floor=0}
 local giftValue={rainbow_wand=3,gold_key=2.5,red_potion=2,gold_potion=4,ghost_potion=1.5,key=1,cell_phone=.8}
+-- Current native HauntletFloor creates ten rooms per floor and assigns ghosts
+-- with replacement. This gives a distribution, never the hidden random result.
+function P.ghostCount(s)
+    if not s.room or s.room.kind~="default"or s.cleared then return 0 end
+    local index=s.roomIndex
+    if index<1 or index>50 then return 3 end
+    local floor=math.ceil(index/10);local room=index-(floor-1)*10
+    return(index>1 and 1 or 0)+(room>=(1-floor/5)*10 and 1 or 0)+(floor==5 and 1 or 0)
+end
+function P.damageProfile(s,db,index,shield)
+    local count=P.ghostCount(s);local doors=s.room and s.room.doors or{}
+    local selected=doors[index]or{};local def=db[selected.kind]or{}
+    local known,weight,total,uncertain=0,0,0,false
+    local maxWeight=100;for _,entry in pairs(db)do if type(entry.ghost_weight)=="number"then maxWeight=math.max(maxWeight,entry.ghost_weight)end end
+    for i,d in ipairs(doors)do
+        if s.revealed[i]and count>0 then known+=1 end
+        local entry=db[d.kind]or{};local w=entry.ghost_weight
+        if d.kind=="copycat"or (d.enter_effect or entry.enter_effect)=="transform"or type(w)~="number"then
+            uncertain=true;w=i==index and maxWeight or 0
+        end
+        w=math.max(0,w);if not s.revealed[i]then total+=w end;if i==index then weight=w end
+    end
+    local minimum=s.revealed[index]and count>0 and 1 or 0
+    local remaining=math.max(0,count-known)
+    -- A revealed door consumes at least one ghost from the room's budget.
+    -- For larger budgets this is a conservative approximation; multiple ghosts
+    -- may share a door and a phone doesn't expose their exact count.
+    local q=minimum>0 and 1 or total>0 and math.min(1,weight/total)or 0
+    local effect=selected.enter_effect or def.enter_effect
+    local hit=effect=="player_take_damage"and(selected.enter_effect_value or def.enter_effect_value or 1)or 0
+    if s.chosen==index then hit=0 end -- entry damage was already applied
+    local protection=shield or s.tempHealth
+    local loss,death,chance=0,0,0
+    local coefficient=1
+    for ghosts=0,remaining do
+        if ghosts>0 then coefficient=coefficient*(remaining-ghosts+1)/ghosts end
+        local probability=coefficient*q^ghosts*(1-q)^(remaining-ghosts)
+        local amount=minimum+ghosts
+        loss+=probability*math.max(0,hit+amount-protection)
+        if hit+amount>=s.health+protection then death+=probability end
+        if amount>0 then chance+=probability end
+    end
+    return {loss=loss,death=death,chance=chance,ghosts=minimum+remaining*q,maxGhosts=minimum+remaining,hit=hit,uncertain=uncertain}
+end
 function P.rank(s,db,includeLocked,includeLethal)
     local out={};local room=s.room;if not room then return out end
     local itemCount=0;for _,count in pairs(s.inventory)do itemCount+=count end
@@ -12902,24 +12946,26 @@ function P.rank(s,db,includeLocked,includeLethal)
         local locks=(d.grey_locks or 0)+(d.gold_locks or 0)
         if not s.failed["door:"..i]and(includeLocked or locks==0)then
             local def=db[d.kind]or{};local risk,benefit,ghostRisk,hit=0,0,0,0
+            local profile={loss=0,death=0,chance=0,maxGhosts=0}
             if room.kind~="default"then
                 risk=areaRisk[d.area_kind]or 1
+                if d.area_kind=="hallway"then risk=.35
+                elseif d.area_kind=="laboratory"then risk=((s.inventory.key or 0)>=2 or(s.inventory.gold_key or 0)>0)and .05 or .65
+                elseif d.area_kind=="mechanical"and s.health<=2 and(s.inventory.red_potion or 0)==0 then risk=1.8
+                elseif d.area_kind=="nightmare"and s.health>=5 and(s.inventory.rainbow_wand or 0)>0 then risk=.9 end
                 if d.area_kind=="spider"then risk+=math.min(itemCount,5)*.15 end
-                benefit=giftValue[(s.gifts or{})[i]]or 0
-                if (s.gifts or{})[i]=="red_potion"and s.health<s.maxHealth then benefit+=2 end
+                local gift=(s.gifts or{})[i]
+                benefit=(giftValue[gift]or 0)/(1+(s.inventory[gift]or 0)*.5)
+                if gift=="red_potion"and s.health<s.maxHealth then benefit+=2 end
+                if gift=="rainbow_wand"and s.health<=2 and(s.inventory.rainbow_wand or 0)==0 then benefit+=2 end
             else
-                -- Weight is a relative risk score, not a probability. Copies
-                -- can transform into another kind; their zero visible weight
-                -- does not certify the hidden door as safe.
-                ghostRisk=s.cleared and 0 or (def.ghost_weight or 100)/100
-                if not s.cleared and d.kind=="copycat"then ghostRisk=math.max(ghostRisk,1)end
-                if s.revealed[i]and not s.cleared then ghostRisk+=12 end
-                risk=ghostRisk
+                profile=P.damageProfile(s,db,i)
+                ghostRisk=profile.ghosts;hit=profile.hit
+                risk=profile.loss+profile.death*12
                 local effect=d.enter_effect or def.enter_effect
-                if effect=="player_take_damage"then
-                    hit=d.enter_effect_value or def.enter_effect_value or 1
-                    risk+=hit*(s.health+s.tempHealth<=hit and 30 or 1.8)
-                elseif effect=="player_lose_item"then risk+=math.min(itemCount,5)*.28
+                if effect=="player_lose_item"then
+                    local value=0;for kind,count in pairs(s.inventory)do value+=(giftValue[kind]or 1)*count end
+                    risk+=itemCount>0 and value/itemCount*.22 or 0
                 elseif effect=="transform"then risk+=1.4
                 elseif effect=="player_bounce"then risk+=1.8 end
                 local total=0;for _,weight in pairs(def.drop_table or{})do total+=weight end
@@ -12933,7 +12979,8 @@ function P.rank(s,db,includeLocked,includeLethal)
             local healthFactor=1+3/math.max(1,s.health+s.tempHealth)
             local utility=benefit*.18-risk*healthFactor+(s.counters[i]or 0)*.015-locks*.08
             if includeLethal or hit<s.health+s.tempHealth then
-                out[#out+1]={index=i,risk=risk,ghostRisk=ghostRisk,hit=hit,benefit=benefit,utility=utility,locks=locks,door=d}
+                out[#out+1]={index=i,risk=risk,ghostRisk=ghostRisk,hit=hit,benefit=benefit,utility=utility,locks=locks,door=d,
+                    deathChance=profile.death,expectedLoss=profile.loss,ghostChance=profile.chance,maxGhosts=profile.maxGhosts}
             end
         end
     end
@@ -12961,9 +13008,10 @@ function P.decide(s,db,now)
     local canUse=not s.pending and s.room.kind=="default"and remaining>2.5
     if not s.pending and remaining>2.5 then
         local goldReady=has("gold_potion")and s.maxHealth+s.tempHealth<s.maxTotal
-        if has("red_potion")and s.health<s.maxHealth and(not goldReady or s.maxHealth-s.health>=2 or s.health<=1)then return item("red_potion","Eksik canı doldur")end
+        local needsHeal=s.health<=1 or s.maxHealth-s.health>=2 or not best or best.deathChance>.01 or best.expectedLoss>=.35
+        if has("red_potion")and s.health<s.maxHealth and needsHeal and(not goldReady or s.maxHealth-s.health>=2 or s.health<=1)then return item("red_potion","Riskli oda öncesi canı doldur")end
         if has("gold_potion")and s.maxHealth+s.tempHealth<s.maxTotal then return item("gold_potion","Kalıcı can kapasitesini artır")end
-        if has("red_potion")and s.health<s.maxHealth then return item("red_potion","Eksik canı doldur")end
+        if has("red_potion")and s.health<s.maxHealth and needsHeal then return item("red_potion","Riskli oda öncesi canı doldur")end
     end
     if canUse then
         local all=P.rank(s,db,true);local locked=all[1]
@@ -12972,16 +13020,17 @@ function P.decide(s,db,now)
             if has("gold_key")then return item("gold_key","Daha güvenli kilitli yolu aç")end
         end
         local target=best or P.rank(s,db,false,true)[1]
-        if not s.chosen and not s.cleared and has("cell_phone")and not next(s.revealed)and best and best.ghostRisk>=.6 and(s.health+s.tempHealth>2 or not has("rainbow_wand"))then return item("cell_phone","Önce hayalet bilgisini al")end
-        if not s.cleared and has("rainbow_wand")and target and target.ghostRisk>0 and(target.ghostRisk>=.8 or s.health+s.tempHealth<=2)then return item("rainbow_wand","Odadaki hayaletleri temizle")end
-        local hit=not s.chosen and target and target.hit or 0
-        local ghostShields=target and(target.ghostRisk>=1.2 and s.health<=2 and 2 or target.ghostRisk>0 and 1 or 0)or 0
-        local shields=s.health<=2 and hit+ghostShields or math.max(hit,ghostShields)
-        if has("ghost_potion")and s.tempHealth<shields and s.maxHealth+s.tempHealth<s.maxTotal then return item("ghost_potion","Bu oda için koruma al")end
+        if not s.chosen and not s.cleared and has("cell_phone")and not next(s.revealed)and best and #ranked>1 and best.ghostChance>=.2 and(s.health+s.tempHealth>2 or not has("rainbow_wand"))then return item("cell_phone","Hayalet bilgisini al; güvenli yolu hesapla")end
+        if not s.cleared and has("rainbow_wand")and target and target.ghostRisk>0 and(target.deathChance>=.05 or target.expectedLoss>=.6)then return item("rainbow_wand","Yüksek hasar riskini temizle")end
+        if has("ghost_potion")and target and s.maxHealth+s.tempHealth<s.maxTotal and(target.deathChance>.001 or target.expectedLoss>=.2)then
+            local protected=P.damageProfile(s,db,target.index,s.tempHealth+1)
+            if protected.death<target.deathChance-.0001 or protected.loss<target.expectedLoss-.15 then return item("ghost_potion","Beklenen hasarı azalt; korumayı boşa harcama")end
+        end
     end
     -- Picking is irreversible, but the server still permits healing/protection.
     if s.chosen then return nil end
-    if best then return{type="door",index=best.index,reason=s.cleared and"Hayaletler temizlendi"or s.room.kind~="default"and"Alan / eşya değerine göre seçim"or"Can ve kapı riskine göre seçim",risk=best.risk}end
+    if best then return{type="door",index=best.index,reason=s.cleared and"Hayaletler temizlendi"or s.room.kind~="default"and"Alan / eşya değerine göre seçim"or"Beklenen hasar / eşya değerine göre seçim",risk=best.risk,
+        expectedLoss=best.expectedLoss,deathChance=best.deathChance,ghostChance=best.ghostChance}end
     return nil
 end
 function P.sent(s,a,now)
@@ -12998,14 +13047,21 @@ return P
     local DB=require(game.ReplicatedStorage.SharedModules.ContentPacks.Halloween2026.Game.Hauntlet.HauntletDoorDB)
     local player=game.Players.LocalPlayer
     local state={running=true,enabled=false,journal=false,busy=false,phase="idle",status="Kapalı",nextAt=0,
-        stats={runs=0,escapes=0,best=0,items=0,doors=0,candy=0,bucks=0,keys=0},history={}}
+        stats={runs=0,escapes=0,best=0,items=0,doors=0,candy=0,bucks=0,keys=0},history={},runsLog={},trace={}}
     local pause="Hauntlet turu için görevler duraklatıldı"
     if previous then
         for k in pairs(state.stats)do state.stats[k]=math.max(0,tonumber((previous.stats or{})[k])or 0)end
         state.history=table.clone(previous.history or{});state.lastRun=previous.lastRun
+        state.runsLog=table.clone(previous.runsLog or{})
     end
     local model,instance,lastRoomModel,ownedPause,origin,operation,joinSent,leaveSent,endedAt,journalAt=nil,nil,nil,false,nil,0,false,false,nil,0
     local leaveReceived=false
+    local runStarted,spent=0,{}
+    local function record(name,detail)
+        state.trace[#state.trace+1]={time=os.clock(),event=name,room=model and model.roomIndex or 0,
+            health=model and model.health or 0,shield=model and model.tempHealth or 0,detail=detail}
+        if #state.trace>120 then table.remove(state.trace,1)end
+    end
     local itemSync
     local function disconnectItemSync()if itemSync then itemSync:Disconnect();itemSync=nil end end
     local function manager()return Manager.get("hauntlet")end
@@ -13042,6 +13098,7 @@ return P
             disconnectItemSync()
             local ok,max=pcall(Cloud.getValue,Cloud,"hauntlet2","max_total_health")
             model=P.new(player.UserId,ok and max or 12);instance=i;observedRoomIndex=0;lastRoomModel=nil;leaveSent=false;leaveReceived=false;endedAt=nil;state.stats.runs+=1
+            runStarted=os.clock();spent={};state.lastDecision=nil;state.lastDoorDecision=nil
         end
         -- A bot enabled/reloaded after enter_game must adopt the next room,
         -- rather than wait for an enter packet that will never be repeated.
@@ -13054,14 +13111,24 @@ return P
             P.reconcile(model,i.runners and i.runners[player],i.inventory)
         end
         if model and(not instance or id==instance.minigame_id)then
+            if name=="leave_game"and leaveReceived then return end
             P.message(model,name,...)
+            local a,b,c,d=...
+            if name=="used_item"then
+                if b then spent[a]=(spent[a]or 0)+1 end
+                record(name,{kind=a,accepted=b})
+            elseif name=="doors_opened"then record(name,{damage=(b or{})[tostring(player.UserId)]or 0})
+            elseif name=="door_effect_triggered"and tonumber(a)==player.UserId then record(name,{kind=c,value=d})
+            elseif name=="started_room"or name=="revealed_ghost"or name=="ghosts_dispelled"or name=="kicked_from_game"then record(name,(type(a)=="string"or type(a)=="number")and a or nil)end
             if name=="started_room"then state.stats.best=math.max(state.stats.best,model.roomIndex)end
             if name=="kicked_from_game"then endedAt=os.clock();if model.ended=="game_completed"then state.stats.escapes+=1 end end
             if name=="leave_game"then
                 disconnectItemSync()
                 leaveReceived=true
                 local data=...;state.lastRewards=data and data.rewards
-                state.lastRun={room=model.roomIndex,health=model.health,outcome=model.ended,rewards=state.lastRewards}
+                state.lastRun={room=model.roomIndex,health=model.health,outcome=model.ended,rewards=state.lastRewards,
+                    duration=runStarted>0 and os.clock()-runStarted or 0,spent=table.clone(spent),remaining=table.clone(model.inventory),decision=state.lastDoorDecision}
+                state.runsLog[#state.runsLog+1]=state.lastRun;if #state.runsLog>12 then table.remove(state.runsLog,1)end
                 for _,r in ipairs(state.lastRewards or{})do
                     if r.type=="currency"then if r.category=="bucks"then state.stats.bucks+=r.amount or 0 else state.stats.candy+=r.amount or 0 end
                     elseif r.kind=="halloween_2026_rusty_key"then state.stats.keys+=r.count or 1 end
@@ -13133,8 +13200,10 @@ return P
             room=model and model.roomIndex or 0,health=model and model.health or 0,maxHealth=model and model.maxHealth or 0,
             inventory=model and table.clone(model.inventory)or{},stats=table.clone(state.stats),pages=d.pages_unlocked or 0,
             tempHealth=model and model.tempHealth or 0,chosen=model and model.chosen,
-            pending=model and model.pending and model.pending.type or nil,history=table.clone(state.history),lastRun=state.lastRun}
+            pending=model and model.pending and model.pending.type or nil,history=table.clone(state.history),lastRun=state.lastRun,
+            runsLog=table.clone(state.runsLog),decision=state.lastDecision}
     end
+    function state.audit()return {trace=table.clone(state.trace),runs=table.clone(state.runsLog),ranked=model and P.rank(model,DB,true,true)or{}}end
     function state.step()
         if not state.running or not hub.running then return end
         local now=os.clock();local m=manager();local i=active()
@@ -13177,6 +13246,8 @@ return P
             -- its queued animation would index nil and stop the entire round.
             if decision.type=="door"and not(instance.enter_circles and instance.enter_circles[decision.index])then return end
             P.sent(model,decision,workspace:GetServerTimeNow());state.status=decision.reason
+            state.lastDecision=table.clone(decision);record("decision",table.clone(decision))
+            if decision.type=="door"then state.lastDoorDecision=table.clone(decision)end
             state.history[#state.history+1]=model.roomIndex.." · "..decision.reason
             if #state.history>12 then table.remove(state.history,1)end
             if decision.type=="item"then
@@ -13491,7 +13562,7 @@ end
     toggle(tabs.hauntlet,"HauntletEnabled","Hauntlet 2 otomasyonu","Otomatik katılır; can, eşya ve kapı riskine göre seçim yapar. Tur sonunda katılma alanından çıkıp farmı sürdürür.",function()return hub.hauntlet.enabled end,hub.hauntlet.setEnabled)
     toggle(tabs.hauntlet,"HauntletJournal","Hak edilen Journal sayfalarını aç","Oynadığın tur sayısının açmaya izin verdiği sayfaları alır.",function()return hub.hauntlet.journal end,hub.hauntlet.setJournal)
     local hauntletStatus=paragraph(tabs.hauntlet,"HauntletStatus","Hauntlet ilerlemesi")
-    tabs.hauntlet:CreateParagraph("HauntletRules",{Title="Kapı ve eşya planı",Content="Telefon bilgisine, doğrudan hasara, kilitlere ve eşya değerine göre seçim yapar. Gri anahtarı uygun olduğunda önce kullanır; altın anahtarı korur. Kapı seçildikten sonra da iyileştirme ve koruma kullanabilir. Her eşya için sunucu onayı bekler; gizli hayaletleri kesin bildiğini varsaymaz."})
+    tabs.hauntlet:CreateParagraph("HauntletRules",{Title="Kapı ve eşya planı",Content="Odanın hayalet sayısını, görünen kapı ağırlıklarını, canı ve korumayı birlikte değerlendirir. Telefon bilgisiyle güvenli kalan yolları bulur. Düşük riskte iyileştirme ve korumayı sonraki odalara saklar. Son 12 turun sonucunu ve kullanılan eşyaları kaydeder. Gizli rastgele sonucu kesin bildiğini varsaymaz."})
     tabs.ghost:CreateParagraph("GhostRules",{Title="Puan planı",Content="Kalkan hayaletleri → açık boss → puan / süre hedefleri.\nBirleşmiş hayaletlerin kütlesini ve kalan ilerlemeyi değerlendirir.\nVurulamayan yörünge hayaletlerini atlar; gerçek ilerleme yoksa hedefi yeniler.\nSaldırı alanından kaçmaz."})
     toggle(tabs.candy,"CandyEnabled","Otomatik şeker topla","Admin Abuse şeker yağmurundaki Candy Corn'u toplar.",function()return candy.enabled end,candy.setEnabled)
     local candyStatus=paragraph(tabs.candy,"CandyStatus","Şeker durumu")
