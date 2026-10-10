@@ -27,7 +27,7 @@ SOFTWARE.
 local env=getgenv()
 local hubVersion=(function()
 -- Increment once per completed release: 1, 1.1, 1.2, ...
-return "1.4"
+return "1.5"
 
 end)()
 local title="bülbül comeback v"..hubVersion
@@ -36,7 +36,7 @@ if env.BulbulComebackLoad and env.BulbulComebackLoad.inProgress then
     warn("["..title.."] Menü yüklemesi devam ediyor; tamamlanmasını bekle.")
     return env.BulbulComeback
 end
-local report={ready=false,stage="Başlatılıyor",build="delta-platform-40",version=hubVersion,title=title}
+local report={ready=false,stage="Başlatılıyor",build="age-batch-lever-41",version=hubVersion,title=title}
 report.inProgress=true
 env.BulbulComebackLoad=report
 local previousCare=env.AdoptMeCompanion
@@ -6577,9 +6577,9 @@ return function(ctx)
                 return ctx.Run(action,valid,function()sent=true;s.attempts+=1 end)
             end)
             if ok and receipt and receipt.confirmed then
-                if action.kind=="age" then s.potions+=1
+                if action.kind=="age" then s.potions+=receipt.count or 1
                 elseif action.kind=="neon" then
-                    if action.mode=="feed" then s.potions+=1;s.neonPotions+=1
+                    if action.mode=="feed" then s.potions+=receipt.count or 1;s.neonPotions+=receipt.count or 1
                     elseif action.mode=="mega" then s.megas+=1 else s.neons+=1 end
                 elseif action.mode=="claim" then s.rewards+=1 else s.opened+=1 end
             end
@@ -6849,12 +6849,95 @@ end
     local neonSettings={species=saved.species and InventoryDB.pets[saved.species] and saved.species or nil,
         target=saved.target=="neon" and "neon" or "mega",repeatGoal=saved.repeatGoal==true,growNormals=saved.growNormals==true,done=0}
     local queue,queueDone={},{}
-    local potionSettings={limit=100,used=0,versions={normal=true,neon=true},kinds={}}
+    local agePrefs=env.BulbulAgePrefs
+    local potionSettings={limit=100,used=0,versions={normal=true,neon=true},kinds={},
+        species=type(agePrefs)=="table" and agePrefs.owner==player.UserId and InventoryDB.pets[agePrefs.species] and agePrefs.species or nil}
     local function saveNeonPrefs()
         env.BulbulNeonPrefs={owner=player.UserId,species=neonSettings.species,target=neonSettings.target,
             repeatGoal=neonSettings.repeatGoal,growNormals=neonSettings.growNormals}
     end
     local function inventory()return CD.get("inventory") or {}end
+    local function ageEligible(pet)
+        local kind=pet.kind or pet.id;local def=InventoryDB.pets[kind];local props=pet.properties or{}
+        return def and not def.is_egg and not def.is_doll and not def.cannot_feed_potions
+            and not props.temporary and not Locks.is_locked(pet) and props.age and props.age>=1 and props.age<6
+            and potionSettings.versions[Neon.level(pet)]
+            and (#potionSettings.kinds==0 or table.find(potionSettings.kinds,kind))
+            and (not neonNative.Eligible or neonNative.Eligible(pet,def))
+    end
+    -- Match the game's CountDialog maximum, including same-kind inventory only.
+    local function potionBatch(pet,item,wrapper)
+        local kind=item.kind or item.id;local effect=Effects[kind]
+        local def=InventoryDB.pets[pet.kind or pet.id]
+        if not effect or not effect.is_age_potion or not def or def.allowed_potions and not table.find(def.allowed_potions,kind)
+            or not effect.validate(wrapper,pet) then return nil end
+        local count=effect.multi_use_count or 1
+        if type(count)=="function" then
+            local ok,value=pcall(count,wrapper,pet);if not ok then return nil end;count=value
+        end
+        if type(count)~="number" or count%1~=0 or count<1 or count==math.huge then return nil end
+        count=math.min(count,potionSettings.limit-potionSettings.used)
+        if count<1 then return nil end
+        local first=item.unique;local ids={}
+        for id,food in pairs(inventory().food or{})do
+            local unique=food.unique or id
+            if (food.kind or food.id)==kind and not Locks.is_locked(food) then
+                if unique==first then ids[1]=unique end
+            end
+        end
+        if not ids[1]then return nil end
+        local additional={}
+        for id,food in pairs(inventory().food or{})do
+            local unique=food.unique or id
+            if unique~=first and (food.kind or food.id)==kind and not Locks.is_locked(food)then additional[#additional+1]=unique end
+        end
+        table.sort(additional,function(a,b)return tostring(a)<tostring(b)end)
+        for i=1,math.min(count-1,#additional)do ids[#ids+1]=additional[i]end
+        return ids
+    end
+    local function agePreview()
+        local inv=inventory();local species=potionSettings.species
+        local selected=care.snapshot().selected
+        local out={species=species,name=species and (InventoryDB.pets[species].name or species) or "Seçili pet (tek pet)",
+            total=0,grown=0,eligible=0,excluded=0,potions=0,batch=0}
+        local candidates={}
+        for id,pet in pairs(inv.pets or{})do
+            if species and (pet.kind or pet.id)==species or not species and (pet.unique or id)==selected then
+                out.total+=1
+                if (pet.properties or{}).age==6 then out.grown+=1
+                elseif ageEligible(pet) then candidates[#candidates+1]={pet=pet,id=pet.unique or id};out.eligible+=1
+                else out.excluded+=1 end
+            end
+        end
+        table.sort(candidates,function(a,b)
+            local ap,bp=a.pet.properties,b.pet.properties
+            if ap.age~=bp.age then return ap.age>bp.age end
+            return (ap.xp or 0)==(bp.xp or 0) and tostring(a.id)<tostring(b.id) or (ap.xp or 0)>(bp.xp or 0)
+        end)
+        local options,seen={},{}
+        for id,item in pairs(inv.food or{})do
+            local kind=item.kind or item.id;local effect=Effects[kind]
+            if effect and effect.is_age_potion and not Locks.is_locked(item)then
+                out.potions+=1
+                if not seen[kind]then
+                    seen[kind]=true;options[#options+1]={item=item,id=item.unique or id,
+                        amount=neonNative.PotionXp(kind) or 0,kind=kind}
+                end
+            end
+        end
+        table.sort(options,function(a,b)return a.amount==b.amount and a.kind<b.kind or a.amount>b.amount end)
+        for _,row in ipairs(candidates)do
+            for _,option in ipairs(options)do
+                local ids=potionBatch(row.pet,option.item,nil)
+                if ids then
+                    out.batch=#ids;out.action={kind="age",mode="feed",species=species,pet=row.id,unique=ids[1],
+                        key="age:"..tostring(ids[1]),ids=ids,beforeAge=row.pet.properties.age,beforeXp=row.pet.properties.xp or 0}
+                    return out
+                end
+            end
+        end
+        return out
+    end
     local progression
     local neonContext={Definition=function(k)return InventoryDB.pets[k]end,Locked=Locks.is_locked,
         Thresholds=function(def)
@@ -6890,8 +6973,9 @@ end
         local inv=CD.get("inventory")
         if a.kind=="neon" or a.kind=="age" then
             local pet=type(inv)=="table" and (inv.pets or {})[a.pet];local props=pet and pet.properties
-            return type(inv)=="table" and type(inv.food)=="table" and inv.food[a.unique]==nil and props
-                and ((props.age or 0)>(a.beforeAge or 0) or (props.xp or 0)>(a.beforeXp or 0))
+            if type(inv)~="table" or type(inv.food)~="table" or not props then return false end
+            for _,id in ipairs(a.ids or {a.unique})do if inv.food[id]~=nil then return false end end
+            return (props.age or 0)>(a.beforeAge or 0) or (props.xp or 0)>(a.beforeXp or 0)
         end
         return type(inv)=="table" and type(inv.food)=="table" and inv.food[a.unique]==nil
     end
@@ -6915,6 +6999,13 @@ end
             if ledger.pending[a.key]then return nil,"Önceki Crypt işleminin bildirimi bekleniyor"end
             return a,a.mode=="claim" and "Son Crypt ödülü alınacak" or "Doğru mezar açılacak · Kat "..a.floor
         end
+        if s.neonEnabled or s.ageEnabled then
+            for _,a in pairs(ledger.pending)do
+                if a.kind=="age" or a.kind=="neon" and a.mode=="feed"then
+                    return nil,"Önceki toplu iksir işleminin sunucu sonucu bekleniyor"
+                end
+            end
+        end
         if s.neonEnabled then
             if not neonNative.ready then return nil,neonNative.reason end
             for _,a in pairs(ledger.pending)do
@@ -6937,30 +7028,11 @@ end
         end
         if s.ageEnabled then
             if potionSettings.used>=potionSettings.limit then return nil,"İksir tüketim sınırı doldu"end
-            local snap=care.snapshot()
-            local pet=(inventory().pets or {})[snap.selected]
-            if not pet then return nil,"Age-Up için pet seç"end
-            local def=InventoryDB.pets[pet.kind or pet.id]
-            if not def or def.is_egg then return nil,"Yumurta açılana kadar Age-Up bekliyor"end
-            local level=Neon.level(pet)
-            if not potionSettings.versions[level]or #potionSettings.kinds>0 and not table.find(potionSettings.kinds,pet.kind or pet.id)then return nil,"Seçili pet iksir filtresine uymuyor"end
-            if def.cannot_feed_potions or pet.properties and pet.properties.temporary then return nil,"Bu pete iksir verilemiyor"end
-            if (pet.properties and pet.properties.age or 0)>=6 then return nil,"Seçili pet yetişkin · Age-Up bekliyor"end
-            local options={}
-            for id,item in pairs(inventory().food or {})do
-                local effect=Effects[item.kind or item.id]
-                if effect and effect.is_age_potion and not Locks.is_locked(item) and
-                    (not def.allowed_potions or table.find(def.allowed_potions,item.kind))then
-                    local key="age:"..tostring(item.unique or id)
-                    if ledger.pending[key]then return nil,"Önceki Age-Up tüketiminin bildirimi bekleniyor"end
-                    table.insert(options,{item=item,unique=item.unique or id,key=key,
-                        rank=item.kind=="tiny_pet_age_potion" and 1 or item.kind=="pet_age_potion" and 2 or 3})
-                end
-            end
-            table.sort(options,function(a,b)return a.rank==b.rank and tostring(a.unique)<tostring(b.unique) or a.rank<b.rank end)
-            local chosen=options[1]
-            if not chosen then return nil,"Envanterde Age-Up iksiri bekleniyor"end
-            return {kind="age",mode="feed",key=chosen.key,unique=chosen.unique,pet=snap.selected,beforeAge=pet.properties.age,beforeXp=pet.properties.xp or 0},"Seçili pete Age-Up verilecek"
+            local preview=agePreview()
+            if preview.action then return preview.action,preview.name.." · "..preview.batch.." iksir topluca verilecek"end
+            if preview.total==0 then return nil,"Age-Up için pet türünü seç veya seçili peti tak"end
+            if preview.eligible==0 then return nil,preview.name.." · yetişkin: "..preview.grown.." · uygun olmayan: "..preview.excluded end
+            return nil,"Uygun Age-Up iksiri veya miktar bilgisi bekleniyor"
         end
         return nil,"Crypt'e girmen bekleniyor"
     end
@@ -6982,7 +7054,7 @@ end
             local cycle=hub.autoJoin
             if not hub.running or Forced.is_enabled() or cycle and cycle.phase~="idle" then return false,"Ghost / geçiş sırasında anahtar ve iksir bekliyor"end
             if hub.houseBuild and hub.houseBuild.busy or hub.transfer and hub.transfer.busy then return false,"Build / ödeme işlemi bekleniyor"end
-            if state and state.neonEnabled and neonNative.Allowed then
+            if state and (state.neonEnabled or state.ageEnabled) and neonNative.Allowed then
                 local ok,why=neonNative.Allowed();if not ok then return false,why end
             end
             return true
@@ -6993,7 +7065,7 @@ end
             ownsPause=true;care.setPaused(pauseText)
             local deadline=os.clock()+30
             while not care.isIdle()do check(valid);assert(os.clock()<deadline,"Bakım temizliği bekleniyor.");task.wait(0.1)end
-            if a.kind=="neon" and a.mode=="feed" then
+            if (a.kind=="neon" or a.kind=="age") and a.mode=="feed" then
                 for _,w in pairs(Equipped.get_my_equipped_char_wrappers())do
                     if w.pet_unique~=a.pet then previousPet=w.pet_unique;break end
                 end
@@ -7051,7 +7123,9 @@ end
                 return {confirmed=confirmed,created=created,status=a.mode=="mega" and "Mega Neon envanterde doğrulandı" or "Neon envanterde doğrulandı"}
             end
             local inv=inventory();local pet=(inv.pets or {})[a.pet]
-            assert(pet and (a.kind=="neon" or care.snapshot().selected==a.pet),"Seçili pet değişti.")
+            assert(pet and (a.kind=="neon" or a.species and potionSettings.species==a.species and (pet.kind or pet.id)==a.species
+                or not a.species and not potionSettings.species and care.snapshot().selected==a.pet),"Seçili pet veya tür değişti.")
+            if a.kind=="age" then assert(ageEligible(pet),"Pet artık Age-Up için uygun değil.")end
             if a.kind=="neon" then
                 local level=Neon.level(pet)
                 assert(neonNative.ready and (level=="neon" or neonSettings.growNormals and level=="normal")
@@ -7066,13 +7140,15 @@ end
             end
             wrapper=findWrapper()
             if not wrapper then
-                if a.kind=="neon" then restorePet=previousPet~=nil;ownedPet=a.pet end
+                restorePet=previousPet~=nil;ownedPet=a.pet
                 assert(Tools.equip(pet),"Pet takılamadı.");assert(waitUntil(function()wrapper=findWrapper();return wrapper~=nil end,10),"Pet takılması doğrulanmadı.")
             end
-            check(valid);assert(a.kind=="neon" or care.snapshot().selected==a.pet,"Seçili pet değişti.")
+            check(valid);assert(a.kind=="neon" or a.species and potionSettings.species==a.species
+                or not a.species and care.snapshot().selected==a.pet,"Seçili pet veya tür değişti.")
             pet=assert((inventory().pets or {})[a.pet]);assert(effect.validate(wrapper,pet),"Pet zaten yetişkin.")
+            if a.kind=="age"then assert(ageEligible(pet),"Pet veya iksir filtresi değişti.")end
             assert((inventory().food or {})[a.unique],"İksir artık envanterde değil.")
-            assert(not Locks.is_locked(item) and Actions.can_feed_pet(wrapper),"Pet şu anda beslenemiyor.")
+            assert(not Locks.is_locked(pet) and not Locks.is_locked(item) and Actions.can_feed_pet(wrapper),"Pet şu anda beslenemiyor.")
             local beforeAge,beforeXp=pet.properties.age,pet.properties.xp or 0
             a.beforeAge,a.beforeXp=beforeAge,beforeXp
             if a.kind=="neon" then
@@ -7084,18 +7160,27 @@ end
                 a.beforeAge,a.beforeXp=beforeAge,beforeXp
             end
             assert(potionSettings.used<potionSettings.limit,"İksir tüketim sınırı doldu.")
-            ledger.pending[a.key]=a;markSent();potionSettings.used+=1
+            -- Recalculate after equipping: XP, locks, quota and stock may have changed.
+            a.ids=assert(potionBatch(pet,item,wrapper),"Toplu iksir miktarı artık uygun değil.")
+            a.count=#a.ids;local additional={};for i=2,#a.ids do additional[#additional+1]=a.ids[i]end
+            ledger.pending[a.key]=a;markSent();potionSettings.used+=a.count
             local object=Router.get("PetObjectAPI/CreatePetObject"):InvokeServer(Creator.PetFood,{
-                unique_id=a.unique,pet_unique=a.pet,additional_consume_uniques={},
+                unique_id=a.unique,pet_unique=a.pet,additional_consume_uniques=additional,
                 spawn_cframe=wrapper.char:GetPivot()*CFrame.new(0,1,-2)*CFrame.fromAxisAngle(Vector3.new(1,0,0),math.pi/2)})
-            if not object then ledger.pending[a.key]=nil;return {rejected=true,status="Pet besleme isteği kabul edilmedi"}end
+            if not object then
+                local untouched=true;for _,id in ipairs(a.ids)do if not (inventory().food or{})[id]then untouched=false;break end end
+                if untouched then
+                    ledger.pending[a.key]=nil;potionSettings.used-=a.count
+                    return {rejected=true,status="Pet besleme isteği kabul edilmedi"}
+                end
+            end
             local confirmed=waitUntil(function()
                 local current=(inventory().pets or {})[a.pet]
                 local props=current and current.properties
                 return applied(a) and props and ((props.age or 0)>beforeAge or (props.xp or 0)>beforeXp)
             end,25)
             if confirmed then ledger.pending[a.key]=nil end
-            return {confirmed=confirmed,status="Age-Up tüketimi ve pet büyümesi doğrulandı"}
+            return {confirmed=confirmed,count=a.count,status=tostring(a.count).." iksir tek çağrıda kullanıldı · pet büyümesi doğrulandı"}
         end,
         Release=function()
             local restoreOk,restoreError=true,nil
@@ -7127,6 +7212,26 @@ end
     state.neonSpecies=function()return Neon.species(inventory(),neonContext)end
     state.neonSettings=neonSettings
     state.potionSettings=potionSettings
+    state.agePreview=agePreview
+    state.ageSpecies=function()
+        local byKind={}
+        for _,pet in pairs(inventory().pets or{})do
+            local kind=pet.kind or pet.id;local def=InventoryDB.pets[kind]
+            if def and not def.is_egg and not def.is_doll and not def.cannot_feed_potions then
+                if not byKind[kind]then byKind[kind]={kind=kind,name=def.name or kind,count=0}end
+                byKind[kind].count+=1
+            end
+        end
+        local rows={};for _,row in pairs(byKind)do rows[#rows+1]=row end
+        table.sort(rows,function(a,b)return a.name==b.name and a.kind<b.kind or a.name<b.name end)
+        return rows
+    end
+    state.setAgeSpecies=function(kind)
+        assert(not state.busy and not state.ageEnabled,"Önce Age-Up işlemini durdur ve sonucunu bekle.")
+        local def=kind and InventoryDB.pets[kind]
+        assert(kind==nil or def and not def.is_egg and not def.is_doll and not def.cannot_feed_potions,"Age-Up pet türü geçersiz.")
+        potionSettings.species=kind;env.BulbulAgePrefs={owner=player.UserId,species=kind}
+    end
     function state.configurePotions(value)
         assert(not state.busy and not state.ageEnabled and not state.neonEnabled,"Önce iksir ve Auto Neon otomasyonunu durdur.")
         local limit=tonumber(value.limit)
@@ -12042,7 +12147,8 @@ return function(parent,care,hub,Model,travel,packageModule,optional)
                             for index,rewardId in ipairs(contents.coffins or{})do
                                 if Layout.can_unlock(d.floors,opened,f,index)then
                                     local reward=(contents.rewards or{})[rewardId]
-                                    local a=action("lever","crypt",d.seed..":"..Layout.padlock_key(f,index),{seed=d.seed,floor=f,index=index,id=Layout.padlock_key(f,index)})
+                                    local a=action("lever","crypt",d.seed..":"..Layout.padlock_key(f,index),{seed=d.seed,floor=f,index=index,id=Layout.padlock_key(f,index),
+                                        expectedLever=reward and reward.kind==Lever.ITEM_KIND or false})
                                     if reward and reward.kind==Lever.ITEM_KIND then target=target or a elseif rewardId=="ladder"then ladder=a end
                                 end
                             end
@@ -12112,23 +12218,75 @@ return function(parent,care,hub,Model,travel,packageModule,optional)
         end
         M.validate(a);a.before=Model.Before(inv());a.candyBefore=balance();return true
     end
+    local function dispatch(a)
+        M.validate(a)
+        if a.feature=="eventshop"then
+            parent.stats.candySpent+=a.cost;parent.stats.eventBought+=1
+            a.reply=Router.get("ShopAPI/BuyItem"):InvokeServer(a.category,a.kind,{buy_count=1})
+        elseif a.mode=="crypt"then parent.stats.eventKeys+=1;a.reply=Crypt.unlock_padlock_async(a.floor,a.index)
+        elseif a.mode=="claim"then a.reply=Crypt.claim_tomb_spider_async()
+        elseif a.mode=="deliver"then a.reply=Net.DeliverLever:invoke_server_async()
+        elseif a.mode=="activate"then Net.ActivateLever:fire_server()end
+        assert(not(type(a.reply)=="table"and a.reply.ok==false),"Etkinlik isteği reddedildi: "..tostring(type(a.reply)=="table"and a.reply.reason))
+    end
+    local function completeRoute(a,valid)
+        local deadline=os.clock()+230
+        local function check()
+            assert(valid()and travel.Valid(),"Elektrikli kol işlemi iptal edildi.")
+            assert(os.clock()<deadline,"Elektrikli kol araması zaman aşımına uğradı.")
+        end
+        local function await(predicate,seconds,message)
+            local untilAt=math.min(deadline,os.clock()+seconds)
+            repeat check();if predicate()then return end;task.wait(.1)until os.clock()>=untilAt
+            error(message)
+        end
+        local step=table.clone(a);step.completeRoute=nil
+        while true do
+            check();a.currentStep=step
+            M.ready(step);check()
+            if parent.notes then parent.notes.lever="Elektrikli kol · "..step.mode..(step.floor and " · Kat "..step.floor or "")end
+            dispatch(step)
+            await(function()return M.confirmed(step)end,15,"Crypt / kol işlemi doğrulanmadı; aynı istek tekrarlanmadı.")
+            if step.mode=="crypt"then
+                -- Opening replicates before the inventory reward (native delay: 3s).
+                if step.expectedLever then
+                    await(function()return owned("toys",Lever.ITEM_KIND)~=nil end,12,"Mezar açıldı ama elektrikli kol envantere gelmedi; yeni mezar açılmadı.")
+                else
+                    local rewardAt=os.clock()+(Rules.REWARD_GRANT_DELAY or 3)+.3
+                    repeat check();task.wait(.1)until os.clock()>=rewardAt
+                end
+            end
+            if leverState()=="activated"then
+                a.sequenceFinished=true;a.currentStep=nil
+                if parent.notes then parent.notes.lever="Elektrikli kol teslim edildi ve etkinleştirildi"end
+                return
+            end
+            local nextStep=M.plan({lever=true})[1]
+            if not nextStep then
+                -- Reached-floor data can arrive after the opened-padlock update.
+                local untilAt=math.min(deadline,os.clock()+4)
+                repeat check();task.wait(.1);nextStep=M.plan({lever=true})[1]until nextStep or os.clock()>=untilAt
+            end
+            if not nextStep then
+                a.sequenceFinished=true;a.currentStep=nil
+                if parent.notes then parent.notes.lever="Crypt araması bekliyor · anahtar / harcama sınırı kontrolü"end
+                return
+            end
+            step=nextStep
+        end
+    end
     function M.send(a,valid)
         task.spawn(function()
             local ok,err=pcall(function()
-                assert(valid());M.validate(a)
-                if a.feature=="eventshop"then
-                    parent.stats.candySpent+=a.cost;parent.stats.eventBought+=1
-                    a.reply=Router.get("ShopAPI/BuyItem"):InvokeServer(a.category,a.kind,{buy_count=1})
-                elseif a.mode=="crypt"then parent.stats.eventKeys+=1;a.reply=Crypt.unlock_padlock_async(a.floor,a.index)
-                elseif a.mode=="claim"then a.reply=Crypt.claim_tomb_spider_async()
-                elseif a.mode=="deliver"then a.reply=Net.DeliverLever:invoke_server_async()
-                elseif a.mode=="activate"then Net.ActivateLever:fire_server()end
+                assert(valid())
+                if a.feature=="lever"and a.completeRoute then completeRoute(a,valid)else dispatch(a)end
             end)
             if not ok then a.sendError=tostring(err)end
         end)
     end
     function M.confirmed(a)
         if a.persisted then return false end
+        if a.feature=="lever"and a.completeRoute then return a.sequenceFinished==true end
         if a.feature=="eventshop"then return a.reply=="success"and Model.NewReward(a.before or{},inv(),a.category,a.kind)and balance()<=a.candyBefore-a.cost end
         if a.mode=="deliver"then return leverState()=="deactivated"and not(inv().toys or{})[a.unique]
         elseif a.mode=="activate"then return leverState()=="activated"
@@ -12598,7 +12756,10 @@ end
     Native=newNative(care,hub,Model,{Move=move,Near=near,Valid=validTransport})
     state=newLoop({Now=os.clock,Wait=task.wait,Spawn=task.spawn,Features=Native.features,Allowed=allowed,
         Plan=function(flags)return Native.plan(flags,ledger.pending)end,
-        Ready=Native.ready,Confirmed=Native.confirmed,Send=Native.send,Timeout=function(a)return a.feature=="license"and 260 or a.feature=="trade"and 90 or 20 end,
+        Ready=function(a)
+            if a.feature=="lever"then a.completeRoute=true end
+            return Native.ready(a)
+        end,Confirmed=Native.confirmed,Send=Native.send,Timeout=function(a)return (a.feature=="license"or a.feature=="lever")and 260 or a.feature=="trade"and 90 or 20 end,
         Persist=function()if hub.sessionControl then hub.sessionControl.checkpoint()end end,
         Acquire=function(valid)
             assert(allowed());local loc=Interiors.get_current_location()
@@ -13290,7 +13451,16 @@ end
     local eventLocationStatus=paragraph(tabs.halloween,"EventLocationStatus","Bulunduğun konum")
     eventLocationStatus.Instance.Frame.LayoutOrder=0
     local traceStatus=paragraph(tabs.tools,"TraceStatus","Kayıt araçları")
-    toggle(tabs.tools,"AutoAgePotion","Otomatik Age-Up iksiri","Otomatik seçilen peti yetişkin olana kadar büyütür; yumurtalarda bekler.",function()return inventoryAutomation.ageEnabled end,inventoryAutomation.setAge)
+    local ageLabels,ageInverse,ageFingerprint,ageSync={},{},nil,false
+    local ageSpecies=tabs.tools:CreateDropdown("AgePotionSpecies",{Title="Age-Up pet türü · bu türdeki tüm petler",Values={"Seçili pet (tek pet)"},Multi=false,
+        Callback=action(function(label)
+            if not ageSync and (label=="Seçili pet (tek pet)" or ageLabels[label]) then
+                local kind=ageLabels[label]
+                if kind~=inventoryAutomation.potionSettings.species then inventoryAutomation.setAgeSpecies(kind)end
+            end
+        end)})
+    hub.controls.AgePotionSpecies=ageSpecies
+    toggle(tabs.tools,"AutoAgePotion","Otomatik toplu Age-Up iksiri","Seçilen türdeki tüm uygun petleri büyütür. Her pete gereken aynı tür iksirleri tek çağrıda verir; sonra sıradaki pete geçer.",function()return inventoryAutomation.ageEnabled end,inventoryAutomation.setAge)
     local ageStatus=paragraph(tabs.tools,"AgePotionStatus","Age-Up durumu")
     toggle(tabs.tools,"AutoStarRewards","Günlük Star Rewards ödülünü al","Hazır günlük yıldız ödülünü alır; yıldız harcamaz ve reklam işlemi başlatmaz.",function()return hub.rewards.star end,function(v)hub.rewards.set("star",v)end)
     toggle(tabs.tools,"AutoDailyRewards","Tamamlanmış görev ödüllerini al","Günlük / etkinlik görevleri ve sekme bonuslarını hazır olduklarında alır.",function()return hub.rewards.dailies end,function(v)hub.rewards.set("dailies",v)end)
@@ -13879,7 +14049,7 @@ return function(hub,care)
         local s=care.snapshot();local a=hub.inventoryAutomation;local pen=hub.rewards.penSettings
         return {schema=2,owner=player.UserId,care={preferEggs=s.preferEggs,petSelectionMode=s.petSelectionMode,excludedTasks=s.excludedTasks,
             waterBudget=s.waterBudget,maxPets=s.maxPets or 1},neon={species=a.neonSettings.species,target=a.neonSettings.target,growNormals=a.neonSettings.growNormals,
-            repeatGoal=a.neonSettings.repeatGoal,queue=a.queueSnapshot().goals},potions={limit=a.potionSettings.limit,kinds=table.clone(a.potionSettings.kinds),
+            repeatGoal=a.neonSettings.repeatGoal,queue=a.queueSnapshot().goals},potions={limit=a.potionSettings.limit,species=a.potionSettings.species,kinds=table.clone(a.potionSettings.kinds),
             versions=(function()local v={}for k in pairs(a.potionSettings.versions)do v[#v+1]=k end return v end)()},
             pen={priority=pen.priority or{},excluded=pen.excluded or{},eggsFirst=pen.eggsFirst,rotateExisting=pen.rotateExisting},
             advanced=hub.advanced.native.config}
@@ -13902,6 +14072,8 @@ return function(hub,care)
         local queueEntries={};for _,g in ipairs(n.queue or{})do assert(DB.pets[g.species]and not DB.pets[g.species].is_egg,"Kuyruk pet türü geçersiz.");queueEntries[#queueEntries+1]=g.species..":"..g.target..":"..g.count end
         local queuePlan=model.NeonQueue(table.concat(queueEntries,","))
         local potions=value.potions;model.Integer(potions.limit,0,10000,"İksir sınırı")
+        local potionDef=potions.species and DB.pets[potions.species]
+        assert(potions.species==nil or potionDef and not potionDef.is_egg and not potionDef.is_doll and not potionDef.cannot_feed_potions,"Age-Up türü geçersiz.")
         for _,kind in ipairs(potions.kinds)do assert(DB.pets[kind],"İksir pet filtresi geçersiz.")end
         for _,version in ipairs(potions.versions)do assert(version=="normal"or version=="neon","İksir sürümü geçersiz.")end
         local pen=value.pen;assert(type(pen)=="table"and type(pen.priority)=="table"and type(pen.excluded)=="table","Pet Pen profili geçersiz.")
@@ -13919,6 +14091,7 @@ return function(hub,care)
         care.setPreferEggs(c.preferEggs);care.setPetSelectionMode(c.petSelectionMode);care.setExcludedTasks(c.excludedTasks);care.setWaterBudget(c.waterBudget);care.setMaxPets(c.maxPets)
         local a=hub.inventoryAutomation;if n.species then a.setNeonSpecies(n.species)end
         a.setNeonTarget(n.target);a.setNeonGrowNormals(n.growNormals);a.setNeonRepeat(n.repeatGoal);a.configureNeonQueue(queuePlan);a.configurePotions(potions)
+        if a.setAgeSpecies then a.setAgeSpecies(potions.species)end
         hub.rewards.configurePen(priority,excluded);hub.rewards.setPenEggs(pen.eggsFirst);hub.rewards.setPenRotate(pen.rotateExisting)
         state.status="Genişletilmiş profil uygulandı; otomasyonlar kapalı"
     end
@@ -14113,7 +14286,7 @@ return function(hub,care,window,action,subtabs)
     button(shop)
     local events=page("events")
     input(events,"cryptKeyLimit","Elektrikli kol ararken en fazla kullanılacak Crypt Key")
-    toggle(events,"lever","Lightning Lever bul / teslim et / etkinleştir","Ulaşılabilir mezarlardaki kolu hedefler; gerekirse alt katlara iner. Skelicorn satın alma ayrıca Alışveriş sekmesindeki şeker bütçesine bağlıdır.")
+    toggle(events,"lever","Lightning Lever bul / teslim et / etkinleştir","Crypt aramasını tek ziyaret içinde sürdürür; kol envantere gelince teslim edip etkinleştirir. Skelicorn satın alma ayrıca Alışveriş sekmesindeki şeker bütçesine bağlıdır.")
     input(events,"catFood","Stray Cat'e verilecek normal yiyecek türü")
     toggle(events,"cat","Stray Cat'i her uygun döngüde besle","Yakınına gider; seçilen kilitsiz yiyeceği bir kez verir.")
     toggle(events,"twig","Crypt'te dal içeren mezarları aç","Yalnız sunucunun gösterdiği dal ödüllerini seçer; anahtar tüketir. Yeni katlar için Crypt otomasyonunu da aç.")
@@ -14264,7 +14437,26 @@ end
         setText(cryptStatus,cryptSnap.status.."\nİşaretlenen merdivenli mezar: "..cryptSnap.matched..(cryptSnap.error and "\n"..cryptSnap.error or ""))
         local work=inventoryAutomation.snapshot()
         local workText=work.status..string.format("\nAçılan mezar: %d · Son ödül: %d · Kullanılan iksir: %d",work.opened,work.rewards,work.potions)
-        setText(inventoryStatus,workText);setText(ageStatus,workText)
+        setText(inventoryStatus,workText)
+        local ap=inventoryAutomation.agePreview();local ps=inventoryAutomation.potionSettings
+        setText(ageStatus,string.format("%s\n%s\nPet: %d · Yetişkin: %d · Büyütülecek: %d · Uygun olmayan: %d\nAge-Up: %d · Sıradaki toplu kullanım: %d\nBu planda tüketilen: %d / %d · Toplam doğrulanan: %d",
+            ap.name,work.ageEnabled and work.status or "Kapalı",ap.total,ap.grown,ap.eligible,ap.excluded,ap.potions,ap.batch,ps.used,ps.limit,work.potions))
+        local ageValues,newAgeLabels,newAgeInverse={"Seçili pet (tek pet)"},{},{}
+        for _,row in ipairs(inventoryAutomation.ageSpecies())do
+            local label=row.name.." · "..row.count.." pet · "..row.kind
+            ageValues[#ageValues+1]=label;newAgeLabels[label]=row.kind;newAgeInverse[row.kind]=label
+        end
+        if ps.species and not newAgeInverse[ps.species]then
+            local label=ap.name.." · uygun pet yok";ageValues[#ageValues+1]=label;newAgeLabels[label]=ps.species;newAgeInverse[ps.species]=label
+        end
+        ageSync=true
+        local ageSignature=table.concat(ageValues,"|")
+        if ageSignature~=ageFingerprint then
+            ageLabels,ageInverse=newAgeLabels,newAgeInverse;ageFingerprint=ageSignature;ageSpecies:SetValues(ageValues)
+        end
+        local ageLabel=ps.species and ageInverse[ps.species] or "Seçili pet (tek pet)"
+        if ageSpecies.Value~=ageLabel then ageSpecies:SetValue(ageLabel)end
+        ageSync=false
         local speciesLabels,newNeonLabels,newNeonInverse={},{},{}
         local speciesRows=inventoryAutomation.neonSpecies();local nameCounts={}
         for _,row in ipairs(speciesRows)do nameCounts[row.name]=(nameCounts[row.name] or 0)+1 end
