@@ -27,7 +27,7 @@ SOFTWARE.
 local env=getgenv()
 local hubVersion=(function()
 -- Increment once per completed release: 1, 1.1, 1.2, ...
-return "1.5"
+return "1.6"
 
 end)()
 local title="bülbül comeback v"..hubVersion
@@ -36,7 +36,7 @@ if env.BulbulComebackLoad and env.BulbulComebackLoad.inProgress then
     warn("["..title.."] Menü yüklemesi devam ediyor; tamamlanmasını bekle.")
     return env.BulbulComeback
 end
-local report={ready=false,stage="Başlatılıyor",build="age-batch-lever-41",version=hubVersion,title=title}
+local report={ready=false,stage="Başlatılıyor",build="build-native-stamp-42",version=hubVersion,title=title}
 report.inProgress=true
 env.BulbulComebackLoad=report
 local previousCare=env.AdoptMeCompanion
@@ -5426,6 +5426,28 @@ return function()
         end
         return out
     end
+    function M.destinationStamp(house)
+        assert(type(house)=="table" and house.house_id~=nil and type(house.furniture)=="table","Hedef ev verisi hazır değil.")
+        -- A fingerprint is not a placement plan. Native hidden/parked furniture
+        -- can have coordinates outside the portable import limits.
+        local furniture={}
+        for unique,data in pairs(house.furniture)do
+            assert(typeof(data.cframe)=="CFrame","Hedef mobilya konumu henüz hazır değil.")
+            local cf={data.cframe:GetComponents()}
+            for _,n in ipairs(cf)do assert(finite(n,3.4e38),"Hedef mobilya konumu sonlu değil.")end
+            local row={kind=data.id,cframe=cf,scale=data.scale or 1,was_free=data.was_free==true,was_default=data.was_default==true}
+            if data.colors then
+                row.colors={}
+                for _,color in ipairs(data.colors)do
+                    assert(typeof(color)=="Color3","Hedef mobilya rengi henüz hazır değil.")
+                    row.colors[#row.colors+1]={color.R,color.G,color.B}
+                end
+            end
+            furniture[unique]=row
+        end
+        return M.signature({houseId=house.house_id,building=house.building_type,addons=house.active_addons or{},
+            furniture=furniture,textures=house.textures or{},ambiance=M.captureAmbiance(house.ambiance)})
+    end
     function M.capture(house)
         assert(type(house)=="table" and house.player and house.house_id~=nil and type(house.furniture)=="table","Yüklenmiş bir ev seç.")
         local out={format=M.FORMAT,version=M.VERSION,building=house.building_type,addons=house.active_addons or {},textures=house.textures or {},items={}}
@@ -5974,14 +5996,7 @@ return M
         TextureDisabled=function(kind,building)local d=HouseDB[building]or {};return kind=="walls" and d.disable_setting_wall_textures or kind=="floors" and d.disable_setting_floor_textures end,
         Ambiance=ambianceAllowed}
     local function stamp(data)
-        -- Includes uniques and flags: a changed destination must be re-reviewed before clearing.
-        local keys={};for k in pairs(data.furniture)do keys[#keys+1]=k end;table.sort(keys)
-        local parts={tostring(data.house_id),data.building_type,model.signature(model.capture(data))}
-        for _,key in ipairs(keys)do
-            local d=data.furniture[key]
-            parts[#parts+1]=key..":"..tostring(d.was_free)..":"..tostring(d.was_default)
-        end
-        return table.concat(parts,"|")
+        return model.destinationStamp(data)
     end
     local function quote(plan,replace,completed)
         local data=own()
